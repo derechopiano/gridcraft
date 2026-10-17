@@ -35,6 +35,19 @@ pub fn specs() -> Vec<CommandSpec> {
             always,
             run_macro
         ),
+        cmd!(query "developer.startMacro", "Run Macro", ["Developer", "Code"], None, "{name, plugin?, timeoutMs?: 30000} → {running}. Starts a native macro; poll until complete", always, start_macro),
+        cmd!(query "developer.pollMacro", "Macro Progress", [], None, "{} → {running, ran?}. Pumps workbook requests; errors restore the original workbook", always, poll_macro),
+        cmd!(query "developer.cancelMacro", "Stop Macro", ["Developer", "Code"], None, "{} → {running}. Requests cancellation; poll until cleanup completes", always, cancel_macro),
+        cmd!(query "developer.pythonSettings", "Python Settings", ["Developer", "Code"], None, "{} → {metadata, allowDownloads}. Workbook PEP 723 metadata and session download approval", always, python_settings),
+        cmd!(
+            "developer.setPythonSettings",
+            "Save Python Settings",
+            ["Developer", "Code"],
+            None,
+            "{metadata, allowDownloads?: false}. Saves PEP 723 comments; download approval is session-only",
+            always,
+            set_python_settings
+        ),
         cmd!(query "developer.modules", "Visual Basic", ["Developer", "Code"], None, "{plugin?} → {modules: [{name, kind, source}]}. The workbook's code modules", always, modules),
         cmd!(
             "developer.saveModule",
@@ -147,6 +160,41 @@ pub fn host_call(s: &mut Session, plugin: &str, method: &str, params: &Json) -> 
             let bytes = s.active().and_then(|d| d.wb.vba_project.clone());
             Ok(json!({"base64": bytes.map(|b| crate::io::base64_encode(&b))}))
         }
+        "host/pythonProject/get" => {
+            let doc = s.active().ok_or_else(|| fail("no workbook is open".into()))?;
+            // Session-local identity prevents a warm provider leaking module globals between books.
+            let allow = doc.wb.python_macros.as_ref().is_some_and(|p| doc.python_download_metadata.as_deref() == Some(p.metadata.as_str()));
+            Ok(json!({"documentId": doc.uid, "project": doc.wb.python_macros, "allowDownloads":allow}))
+        }
+        "host/pythonProject/set" => {
+            let project: gridcraft_model::PythonMacroProject =
+                serde_json::from_value(params.get("project").cloned().ok_or_else(|| fail("`project` is required".into()))?)
+                    .map_err(|e| fail(e.to_string()))?;
+            let d = s.active_mut().ok_or_else(|| fail("no workbook is open".into()))?;
+            if d.wb.python_macros.as_deref() != Some(&project) {
+                if d.wb.python_macros.as_ref().is_none_or(|old| old.metadata != project.metadata) {
+                    d.python_download_metadata = None;
+                }
+                std::sync::Arc::make_mut(&mut d.wb).python_macros = Some(std::sync::Arc::new(project));
+            }
+            Ok(json!({}))
+        }
+        "host/engine.execute" => {
+            // Reuse engine commands within the shared macro host's existing transaction.
+            // Recursive macro/plugin execution and external file/app operations are excluded.
+            let command = params.get("command").and_then(Json::as_str).ok_or_else(|| fail("`command` is required".into()))?;
+            if !matches!(command, "sheet.read" | "cell.get" | "document.inspect" | "selection.set")
+                && !["cell.", "range.", "home.", "sheet.", "table."].iter().any(|p| command.starts_with(p))
+                && !matches!(command, "data.sort" | "data.sortAscending" | "data.sortDescending" | "data.filter" | "insert.chart")
+            {
+                return Err(fail(format!("Command {command} is unavailable inside a macro transaction")));
+            }
+            let args = params.get("params").cloned().unwrap_or_else(|| json!({}));
+            if ["path", "base64", "url"].iter().any(|key| args.get(key).is_some()) {
+                return Err(fail("External resources are unavailable inside a macro transaction".into()));
+            }
+            s.execute(command, args).map_err(|e| fail(e.to_string()))
+        }
         "host/vbaProject/set" => {
             let b64 = params.get("base64").and_then(Json::as_str).ok_or_else(|| fail("`base64` is required".into()))?;
             if b64.len() > MAX_PROJECT / 3 * 4 + 8 {
@@ -179,19 +227,14 @@ pub fn host_call(s: &mut Session, plugin: &str, method: &str, params: &Json) -> 
 /// requests run are one step of `id` (their own undo and journal entries are dropped), and a
 /// failure takes them back.
 fn call(s: &mut Session, _id: &str, plugin: &str, method: &str, params: Json) -> Result<Json> {
-    let before = s.active().map(|d| (d.uid, d.wb.clone(), d.selection.clone(), d.undo.len()));
-    let journal_len = s.journal.len();
-    let r = call_macros(plugin, method, params, &mut |m, p| host_call(s, plugin, m, p));
-    s.journal.truncate(journal_len);
-    if let Some((uid, wb, sel, undo_len)) = before
-        && let Some(d) = s.docs.iter_mut().find(|d| d.uid == uid)
-    {
-        d.undo.truncate(undo_len);
-        if r.is_err() {
-            d.wb = wb;
-            d.selection = sel;
-            d.calc.rebuild(&d.wb);
-        }
+    let before = crate::macro_transaction::Snapshot::capture(s);
+    let was_host = s.macro_host_call;
+    s.macro_host_call = true;
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| call_macros(plugin, method, params, &mut |m, p| host_call(s, plugin, m, p))));
+    s.macro_host_call = was_host;
+    let r = r.unwrap_or_else(|_| Err("the macro host failed while processing a workbook request".into()));
+    if let Some(before) = before {
+        before.restore(s, r.is_ok());
     }
     // The add-in's own words (a macro's `Run-time error '9': Subscript out of range`).
     r.map_err(EngineError::Other)
@@ -215,15 +258,18 @@ fn macros(s: &mut Session, p: &Json) -> Result<Json> {
     Ok(json!({"macros": out, "enabled": macros_allowed(s), "security": s.prefs.macro_security}))
 }
 
+fn require_macros_allowed(s: &Session, id: &str) -> Result<()> {
+    if macros_allowed(s) {
+        Ok(())
+    } else {
+        Err(EngineError::Disabled(id.into(), "macros are disabled for this workbook: Enable Content, or change Developer › Macro Security".into()))
+    }
+}
+
 fn run_macro(s: &mut Session, p: &Json) -> Result<Json> {
     const ID: &str = "developer.runMacro";
     let name = str_param(p, "name").filter(|n| !n.trim().is_empty()).ok_or_else(|| bad(ID, "missing `name`"))?.to_string();
-    if !macros_allowed(s) {
-        return Err(EngineError::Disabled(
-            ID.into(),
-            "macros are disabled for this workbook: Enable Content, or change Developer › Macro Security".into(),
-        ));
-    }
+    require_macros_allowed(s, ID)?;
     let (plugin, _) = macro_plugin(ID, p)?;
     let mut params = json!({"name": name});
     // A ribbon button's macro gets the button (`control.Id`, `control.Tag`).
@@ -234,6 +280,39 @@ fn run_macro(s: &mut Session, p: &Json) -> Result<Json> {
     params["context"] = super::plugins::brief_context(s);
     call(s, ID, &plugin, "macros/run", params)?;
     Ok(json!({"ran": name}))
+}
+
+fn start_macro(s: &mut Session, p: &Json) -> Result<Json> {
+    require_macros_allowed(s, "developer.startMacro")?;
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        crate::macro_transaction::start(s, p)
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = p;
+        Err(bad("developer.startMacro", "native macros need the desktop app or CLI"))
+    }
+}
+
+fn poll_macro(s: &mut Session, _: &Json) -> Result<Json> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        crate::macro_transaction::poll(s)
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = s;
+        Ok(json!({"running":false}))
+    }
+}
+
+fn cancel_macro(s: &mut Session, _: &Json) -> Result<Json> {
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(run) = &s.macro_run {
+        run.call.cancel();
+    }
+    Ok(json!({"running":s.macro_running()}))
 }
 
 /// The workbook's ribbon: its own (editable), or the buttons of a richer one kept from the file.
@@ -441,7 +520,15 @@ fn press_ribbon_button(s: &mut Session, p: &Json) -> Result<Json> {
     let b = r.button(id).ok_or_else(|| bad(ID, format!("no ribbon button `{id}`")))?;
     // Excel's form `'Book1.xlsm'!Module1.Go` names this workbook's macro.
     let name = b.on_action.rsplit('!').next().unwrap_or(&b.on_action).to_string();
-    run_macro(s, &json!({"name": name, "control": {"id": b.id, "tag": b.tag.clone().unwrap_or_default()}}))
+    require_macros_allowed(s, ID)?;
+    // Python's initial workbook adapter has no Office ribbon callback ABI. Loading it
+    // before a VBA add-in must not redirect an existing workbook's callbacks to Python.
+    let plugin = gridcraft_plugin::macro_ribbon_plugins()
+        .into_iter()
+        .next()
+        .map(|(id, _)| id)
+        .ok_or_else(|| bad(ID, "no add-in supports this workbook's ribbon callbacks"))?;
+    run_macro(s, &json!({"plugin": plugin, "name": name, "control": {"id": b.id, "tag": b.tag.clone().unwrap_or_default()}}))
 }
 
 fn modules(s: &mut Session, p: &Json) -> Result<Json> {
@@ -473,6 +560,7 @@ fn record_to_code(s: &mut Session, p: &Json) -> Result<Json> {
     const ID: &str = "developer.recordToCode";
     let steps = p.get("steps").cloned().filter(Json::is_array).ok_or_else(|| bad(ID, "missing `steps` (a list of {command, params})"))?;
     let (plugin, _) = macro_plugin(ID, p)?;
+    require_recording(ID, &plugin)?;
     call(s, ID, &plugin, "macros/record", json!({"steps": steps}))
 }
 
@@ -480,7 +568,8 @@ fn record_macro(s: &mut Session, p: &Json) -> Result<Json> {
     const ID: &str = "developer.recordMacro";
     let stop = p.get("stop").and_then(Json::as_bool).unwrap_or(s.recording.is_some());
     if !stop {
-        macro_plugin(ID, p)?;
+        let (plugin, _) = macro_plugin(ID, p)?;
+        require_recording(ID, &plugin)?;
         s.recording = Some(s.journal.len());
         return Ok(json!({"recording": true}));
     }
@@ -493,6 +582,7 @@ fn record_macro(s: &mut Session, p: &Json) -> Result<Json> {
         .map(|(id, p)| json!({"command": id, "params": p}))
         .collect();
     let (plugin, _) = macro_plugin(ID, p)?;
+    require_recording(ID, &plugin)?;
     let code = call(s, ID, &plugin, "macros/record", json!({"steps": steps}))?;
     let source = code.get("source").and_then(Json::as_str).unwrap_or("").to_string();
     // The new macro goes at the end of the module (Module1 by default), as Excel records it.
@@ -507,6 +597,14 @@ fn record_macro(s: &mut Session, p: &Json) -> Result<Json> {
         .unwrap_or_default();
     call(s, ID, &plugin, "macros/saveModule", json!({"name": module, "source": format!("{before}{source}")}))?;
     Ok(json!({"recording": false, "module": module, "source": source, "steps": steps.len()}))
+}
+
+fn require_recording(id: &str, plugin: &str) -> Result<()> {
+    if gridcraft_plugin::macro_recording_plugins().iter().any(|(pid, _)| pid == plugin) {
+        Ok(())
+    } else {
+        Err(bad(id, "this macro add-in does not support recording"))
+    }
 }
 
 fn enable_macros(s: &mut Session, p: &Json) -> Result<Json> {
@@ -524,4 +622,29 @@ fn macro_security(s: &mut Session, p: &Json) -> Result<Json> {
         s.prefs.macro_security = level.to_string();
     }
     Ok(json!({"level": s.prefs.macro_security}))
+}
+
+fn python_settings(s: &mut Session, _: &Json) -> Result<Json> {
+    let d = s.doc()?;
+    let project = d.wb.python_macros.as_deref().cloned().unwrap_or_default();
+    Ok(json!({"metadata":project.metadata,"allowDownloads":d.python_download_metadata.as_deref()==Some(project.metadata.as_str())}))
+}
+
+fn set_python_settings(s: &mut Session, p: &Json) -> Result<Json> {
+    const ID: &str = "developer.setPythonSettings";
+    let metadata = str_param(p, "metadata").ok_or_else(|| bad(ID, "missing `metadata`"))?;
+    gridcraft_model::python_macros::validate_metadata(metadata).map_err(|e| bad(ID, e))?;
+    let allow = match p.get("allowDownloads") {
+        None => false,
+        Some(value) => value.as_bool().ok_or_else(|| bad(ID, "`allowDownloads` must be a boolean"))?,
+    };
+    let d = s.doc_mut()?;
+    let mut project = d.wb.python_macros.as_deref().cloned().unwrap_or_default();
+    project.metadata = metadata.into();
+    project.validate().map_err(|e| bad(ID, e))?;
+    if d.wb.python_macros.as_deref() != Some(&project) {
+        std::sync::Arc::make_mut(&mut d.wb).python_macros = Some(std::sync::Arc::new(project));
+    }
+    d.python_download_metadata = allow.then(|| metadata.to_string());
+    Ok(json!({"allowDownloads":allow}))
 }

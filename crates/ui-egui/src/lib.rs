@@ -1146,6 +1146,9 @@ impl SheetApp {
             ctx.request_repaint();
         }
         control::poll(self, ctx);
+        if self.session.macro_running() {
+            return;
+        } // Leave arrived files queued until rollback/commit.
         // Files read asynchronously (web file picker, dropped files).
         let arrived: Vec<(String, Vec<u8>)> = self
             .services
@@ -1183,21 +1186,29 @@ impl SheetApp {
     /// Lays out the whole window.
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
-        self.poll_printing(&ctx);
-        plugin_ui::poll_install(self, &ctx);
-        plugin_ui::poll_events(self, &ctx);
-        collab_ui::pump(self, &ctx);
-        office_pane::pump(self);
+        developer_ui::poll_macro(self, &ctx);
+        let macro_busy = self.session.macro_running();
+        if macro_busy {
+            ui.disable();
+        } else {
+            self.poll_printing(&ctx);
+            plugin_ui::poll_install(self, &ctx);
+            plugin_ui::poll_events(self, &ctx);
+            collab_ui::pump(self, &ctx);
+            office_pane::pump(self);
+        }
         if !self.fonts_ready || self.fonts_rebind {
             ctx.request_repaint();
             return;
         }
         let t0 = now_ms();
-        text_box::before_ui(self, &ctx);
+        if !macro_busy {
+            text_box::before_ui(self, &ctx);
+        }
         // The language the widgets translate with this frame (see `i18n::current`).
         i18n::set_current(&ctx, self.ui.language);
         let t = theme::Tokens::get(&ctx);
-        if self.backstage.is_none() {
+        if !macro_busy && self.backstage.is_none() {
             self.ribbon_keys(&ctx);
         }
         ribbon::title_bar(self, ui);
@@ -1217,7 +1228,11 @@ impl SheetApp {
             }
             tabs::sheet_tabs(self, ui);
             pivot_pane::show(self, ui);
-            office_pane::show(self, ui);
+            if macro_busy {
+                office_pane::covered(self);
+            } else {
+                office_pane::show(self, ui);
+            }
             panes::show(self, ui);
             egui::CentralPanel::default().frame(egui::Frame::NONE.fill(t.grid_bg)).show(ui, |ui| {
                 let g0 = now_ms();
@@ -1225,11 +1240,15 @@ impl SheetApp {
                 self.perf.grid_ms = now_ms() - g0;
             });
         }
-        dialogs::show(self, &ctx);
-        plugin_ui::dialog_window(self, &ctx);
-        developer_ui::windows(self, &ctx);
-        widgets::message_box(self, &ctx);
-        widgets::toast(self, &ctx);
+        if macro_busy {
+            developer_ui::macro_progress(self, &ctx);
+        } else {
+            dialogs::show(self, &ctx);
+            plugin_ui::dialog_window(self, &ctx);
+            developer_ui::windows(self, &ctx);
+            widgets::message_box(self, &ctx);
+            widgets::toast(self, &ctx);
+        }
         control::issue_screenshots(self, &ctx);
         control::collect_screenshots(self, &ctx);
         if !ctx.input(|i| i.focused) {
@@ -1245,7 +1264,8 @@ impl SheetApp {
         }
         self.perf.last = now;
         // AutoSave: save workbooks that have a file shortly after they change.
-        if self.grid.autosave
+        if !self.session.macro_running()
+            && self.grid.autosave
             && self.editor.is_none()
             && self.text_box_editor.is_none()
             && now - self.grid.last_autosave > 2000.0

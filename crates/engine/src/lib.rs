@@ -16,6 +16,7 @@ pub mod fill;
 pub mod io;
 pub mod links;
 pub mod live;
+mod macro_transaction;
 pub mod outline;
 pub mod paper;
 pub mod pivot;
@@ -119,6 +120,8 @@ pub struct DocState {
     /// The user enabled this workbook's macros (the message bar's Enable Content, or Macro
     /// Security set to enable all).
     pub macros_enabled: bool,
+    /// User approval for uv downloads, bound to exact metadata in this session; never serialized.
+    pub python_download_metadata: Option<String>,
     /// Row and column inserts and deletes of the command running now, for a live session (the
     /// ids of the lines move with them). Cleared after every command.
     pub struct_log: Vec<gridcraft_collab::StructOp>,
@@ -154,6 +157,7 @@ impl DocState {
             unlocked_ranges: vec![],
             content_kind: None,
             macros_enabled: false,
+            python_download_metadata: None,
             struct_log: vec![],
         }
     }
@@ -343,12 +347,34 @@ pub struct Session {
     /// Commands running inside commands (a plugin command's steps): a live session shares the
     /// outermost one's effect as one change.
     depth: u32,
+    #[cfg(not(target_arch = "wasm32"))]
+    macro_run: Option<macro_transaction::MacroRun>,
+    macro_host_call: bool,
 }
 
 impl Session {
     pub fn new() -> Session {
         Session::default()
     }
+    /// True while a native macro transaction is in flight, including its host edits.
+    pub fn macro_running(&self) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.macro_run.is_some() || self.macro_host_call
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            false
+        }
+    }
+
+    fn abort_macro_before_document_change(&mut self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        if !self.macro_host_call {
+            macro_transaction::abort(self);
+        }
+    }
+
     pub fn documents(&self) -> &[DocState] {
         &self.docs
     }
@@ -356,7 +382,8 @@ impl Session {
         self.active
     }
     pub fn set_active(&mut self, i: usize) {
-        if i < self.docs.len() {
+        if i < self.docs.len() && i != self.active {
+            self.abort_macro_before_document_change();
             self.active = i;
         }
     }
@@ -373,12 +400,14 @@ impl Session {
         self.active_mut().ok_or(EngineError::NoDocument)
     }
     pub fn add_document(&mut self, d: DocState) -> usize {
+        self.abort_macro_before_document_change();
         self.docs.push(d);
         self.active = self.docs.len() - 1;
         self.active
     }
     pub fn close_document(&mut self, i: usize) {
         if i < self.docs.len() {
+            self.abort_macro_before_document_change();
             self.docs.remove(i);
             if self.active >= self.docs.len() {
                 self.active = self.docs.len().saturating_sub(1);
@@ -405,6 +434,9 @@ impl Session {
     /// session, the outermost command's change is shared as one update, and Undo and Redo are
     /// the person's own.
     pub fn execute(&mut self, id: &str, params: Json) -> Result<Json> {
+        if self.macro_running() && !self.macro_host_call && !matches!(id, "developer.pollMacro" | "developer.cancelMacro") {
+            return Err(EngineError::Disabled(id.into(), "a macro is running: stop it before editing or saving".into()));
+        }
         if self.depth == 0
             && !self.collab.rooms.is_empty()
             && let Some(r) = collab::intercept(self, id, &params)
@@ -421,7 +453,7 @@ impl Session {
         self.depth += 1;
         let r = self.execute_inner(id, params);
         self.depth = self.depth.saturating_sub(1);
-        if self.depth == 0 {
+        if self.depth == 0 && !self.macro_running() {
             collab::after_command(self);
             self.recalc_invalidated();
         }
@@ -432,6 +464,9 @@ impl Session {
     /// time (`host/functions/invalidate`, protocol 2.2). Runs after each command and between
     /// frames; a workbook that had no unsaved changes still has none. True when there were any.
     pub fn recalc_invalidated(&mut self) -> bool {
+        if self.macro_running() {
+            return false;
+        }
         let names = gridcraft_plugin::take_invalidated();
         if names.is_empty() {
             return false;
@@ -468,13 +503,14 @@ impl Session {
                 return Err(EngineError::Internal(id.to_string(), msg));
             }
         };
-        if spec.journal && result.is_ok() {
+        if spec.journal && result.is_ok() && !self.macro_host_call {
             self.journal.push((id.to_string(), cmd::journal_params(&params)));
             if self.journal.len() > 10_000 {
                 self.journal.drain(..5_000);
             }
         }
         if spec.undoable
+            && !self.macro_host_call
             && let Some((uid, wb, sel)) = before
             && let Some(d) = self.docs.iter_mut().find(|d| d.uid == uid)
             && !Arc::ptr_eq(&d.wb, &wb)
@@ -494,6 +530,9 @@ impl Session {
     }
 
     pub fn take_ui_requests(&mut self) -> Vec<UiRequest> {
+        if self.macro_running() {
+            return Vec::new();
+        }
         std::mem::take(&mut self.ui_requests)
     }
 
@@ -501,6 +540,12 @@ impl Session {
     /// queued a file dialog because it got no file (`file.open`, `file.saveAs`, `file.save` on a workbook with no
     /// file yet, `data.getData`) is an error instead of a silent success.
     pub fn execute_headless(&mut self, id: &str, params: Json) -> Result<Json> {
+        if id == "developer.startMacro" {
+            return Err(EngineError::BadParams {
+                cmd: id.into(),
+                msg: "headless callers must use developer.runMacro, which waits for completion".into(),
+            });
+        }
         let r = self.execute(id, params);
         let requests = self.take_ui_requests();
         let asked_for_file = requests.iter().any(|q| matches!(q, UiRequest::Dialog(name, _) if name == "open" || name == "saveAs"));

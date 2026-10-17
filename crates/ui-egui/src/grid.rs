@@ -757,6 +757,10 @@ pub fn show(app: &mut SheetApp, ui: &mut egui::Ui) {
     if geo.paper.is_some() {
         crate::paper_view::paint_rulers(app, &painter, rect, &geo, &t);
     }
+    // Keep painting the workbook under the progress modal, without direct grid edits/popups.
+    if app.session.macro_running() {
+        return;
+    }
     // Interaction.
     let previous_popups = (app.grid.filter_menu, app.grid.list_picker, app.grid.header_menu);
     crate::paper_view::interact(app, ui, &resp, &geo, sh, &wb);

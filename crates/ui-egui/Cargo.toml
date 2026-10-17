@@ -41,3 +41,8 @@ web-sys = { version = "0.3", features = ["Window", "Navigator"] }
 [build-dependencies]
 serde_json = { workspace = true }
 toml = "1"
+
+[[test]]
+name = "async_macros"
+path = "tests/async_macros.rs"
+harness = false

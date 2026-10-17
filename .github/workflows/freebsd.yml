@@ -25,3 +25,9 @@ jobs:
     uses: storytold/craft-common-actions/.github/workflows/freebsd.yml@main
     with:
       craft-fonts-ref: abb83316d96aa59c1cf64784289e378fe9fa5695
+      custom-test-command: |
+        pkg install -y uv
+        export GRIDCRAFT_TEST_PYTHON="$(command -v python3)"
+        export GRIDCRAFT_TEST_UV="$(command -v uv)"
+        "$GRIDCRAFT_TEST_UV" --version
+        CARGO_PROFILE_DEV_DEBUG=0 cargo test --workspace --locked

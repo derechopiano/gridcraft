@@ -1,4 +1,4 @@
-//! The Developer tab: macros run by a macro add-in (VBA). It shows once an add-in that runs
+//! The Developer tab: macros run by a macro add-in. It shows once an add-in that runs
 //! macros is loaded (`"macros": {"language": "VBA"}` in its manifest), with Visual Basic (the
 //! workbook's code modules in an editor), Macros (list, run, edit, create, delete), Record Macro,
 //! Macro Security and Add-ins. Everything goes through the `developer.*` commands; the add-in
@@ -25,6 +25,9 @@ pub struct DevState {
     pub macros: Option<MacrosWindow>,
     pub editor: Option<Editor>,
     pub security: bool,
+    pub running_macro: Option<String>,
+    pub stopping_macro: bool,
+    python_settings: Option<PythonSettings>,
     pub buttons: Option<ButtonsWindow>,
     /// The workbook's ribbon as last read: (workbook uid, workbook pointer, tabs, editable).
     book: Option<(u64, usize, std::rc::Rc<Vec<(String, Vec<RibbonGroup>)>>, bool)>,
@@ -34,10 +37,18 @@ pub struct DevState {
 
 #[derive(Default)]
 pub struct MacrosWindow {
+    pub provider: String,
     pub list: Vec<Json>,
     pub selected: usize,
     pub new_name: String,
     pub error: Option<String>,
+}
+
+struct PythonSettings {
+    uid: u64,
+    metadata: String,
+    allow_downloads: bool,
+    error: Option<String>,
 }
 
 /// Developer › Ribbon Buttons: the workbook's buttons, and the form adding one.
@@ -55,6 +66,8 @@ pub struct ButtonsWindow {
 
 #[derive(Default)]
 pub struct Editor {
+    pub provider: String,
+    pub language: String,
     /// (name, kind, source)
     pub modules: Vec<(String, String, String)>,
     pub current: usize,
@@ -73,6 +86,20 @@ fn language() -> String {
     gridcraft_engine::plugin::macro_plugins().into_iter().next().map(|(_, l)| l).unwrap_or_else(|| "VBA".into())
 }
 
+fn provider_language(provider: &str) -> String {
+    gridcraft_engine::plugin::macro_plugins().into_iter().find(|(id, _)| id == provider).map(|(_, l)| l).unwrap_or_default()
+}
+
+fn provider_picker(ui: &mut Ui, salt: &str, provider: &mut String) -> bool {
+    let before = provider.clone();
+    egui::ComboBox::from_id_salt(salt).selected_text(provider_language(provider)).show_ui(ui, |ui| {
+        for (id, language) in gridcraft_engine::plugin::macro_plugins() {
+            ui.selectable_value(provider, id.clone(), format!("{language} ({id})"));
+        }
+    });
+    *provider != before
+}
+
 /// Names a painted button for screen readers (and tests).
 fn named(resp: egui::Response, label: &str) -> egui::Response {
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
@@ -80,7 +107,9 @@ fn named(resp: egui::Response, label: &str) -> egui::Response {
 }
 
 pub fn ribbon(app: &mut SheetApp, ui: &mut Ui) {
-    if named(big_button(ui, Icon::Script, "Visual\nBasic", "The workbook's code modules", false), "Visual Basic").clicked() {
+    let editor_label = if language() == "VBA" { "Visual\nBasic" } else { "Code\nEditor" };
+    let editor_name = if language() == "VBA" { "Visual Basic" } else { "Code Editor" };
+    if named(big_button(ui, Icon::Script, editor_label, "The workbook's code modules", false), editor_name).clicked() {
         open_editor(app, None);
     }
     if named(big_button(ui, Icon::Script, "Macros", "Run, edit or delete a macro", false), "Macros").clicked() {
@@ -88,15 +117,23 @@ pub fn ribbon(app: &mut SheetApp, ui: &mut Ui) {
     }
     ui.vertical(|ui| {
         let recording = app.session.recording.is_some();
+        let recorder = gridcraft_engine::plugin::macro_recording_plugins().into_iter().next().map(|(id, _)| id);
         let label = if recording { "Stop Recording" } else { "Record Macro" };
-        if named(small_button(ui, if recording { Icon::Close } else { Icon::Plus }, label, "Record what you do as a macro in Module1", false), label)
+        if ui
+            .add_enabled_ui(recording || recorder.is_some(), |ui| {
+                named(
+                    small_button(ui, if recording { Icon::Close } else { Icon::Plus }, label, "Record what you do as a macro in Module1", false),
+                    label,
+                )
+            })
+            .inner
             .clicked()
         {
-            match app.session.run("developer.recordMacro", json!({"stop": recording})) {
+            match app.session.run("developer.recordMacro", json!({"stop": recording, "plugin": recorder})) {
                 Ok(r) if recording => {
                     let module = r.get("module").and_then(Json::as_str).unwrap_or("Module1").to_string();
                     app.after_engine();
-                    open_editor(app, Some(&module));
+                    open_editor_for(app, Some(&module), recorder.as_deref());
                 }
                 Ok(_) => app.after_engine(),
                 Err(e) => app.message = Some(("Record Macro".into(), e)),
@@ -215,12 +252,14 @@ pub fn book_ribbon_groups(app: &mut SheetApp, ui: &mut Ui, tab: &str, separate_f
 /// Opens Developer › Ribbon Buttons, with `macro_name` filled in.
 pub fn open_buttons(app: &mut SheetApp, macro_name: Option<&str>) {
     let mut w = ButtonsWindow { tab: "Macros".into(), group: "Macros".into(), image: "MacroPlay".into(), ..Default::default() };
+    let providers: std::collections::HashSet<_> = gridcraft_engine::plugin::macro_ribbon_plugins().into_iter().map(|(id, _)| id).collect();
     if let Ok(r) = app.session.run("developer.macros", json!({})) {
         w.macros = r
             .get("macros")
             .and_then(Json::as_array)
             .into_iter()
             .flatten()
+            .filter(|m| m.get("plugin").and_then(Json::as_str).is_some_and(|id| providers.contains(id)))
             .filter_map(|m| m.get("name").and_then(Json::as_str))
             .map(str::to_string)
             .collect();
@@ -346,7 +385,10 @@ fn buttons_window(app: &mut SheetApp, ctx: &egui::Context) {
 }
 
 pub fn open_macros(app: &mut SheetApp) {
-    let mut w = MacrosWindow::default();
+    let mut w = MacrosWindow {
+        provider: gridcraft_engine::plugin::macro_plugins().into_iter().next().map(|(id, _)| id).unwrap_or_default(),
+        ..Default::default()
+    };
     match app.session.run("developer.macros", json!({})) {
         Ok(r) => w.list = r.get("macros").and_then(Json::as_array).cloned().unwrap_or_default(),
         Err(e) => w.error = Some(e),
@@ -356,8 +398,14 @@ pub fn open_macros(app: &mut SheetApp) {
 }
 
 pub fn open_editor(app: &mut SheetApp, module: Option<&str>) {
-    let mut e = Editor::default();
-    match app.session.run("developer.modules", json!({})) {
+    open_editor_for(app, module, None);
+}
+
+fn open_editor_for(app: &mut SheetApp, module: Option<&str>, provider: Option<&str>) {
+    let provider =
+        provider.map(str::to_owned).or_else(|| gridcraft_engine::plugin::macro_plugins().into_iter().next().map(|(id, _)| id)).unwrap_or_default();
+    let mut e = Editor { language: provider_language(&provider), provider, ..Default::default() };
+    match app.session.run("developer.modules", json!({"plugin": e.provider})) {
         Ok(r) => {
             e.modules = r
                 .get("modules")
@@ -386,7 +434,7 @@ pub fn notice(app: &mut SheetApp) {
         return;
     }
     let Some(d) = app.session.active() else { return };
-    if d.wb.vba_project.is_none() || d.macros_enabled || app.dev.notice_seen.contains(&d.uid) {
+    if (d.wb.vba_project.is_none() && d.wb.python_macros.is_none()) || d.macros_enabled || app.dev.notice_seen.contains(&d.uid) {
         return;
     }
     app.dev.notice_seen.insert(d.uid);
@@ -403,13 +451,14 @@ pub fn windows(app: &mut SheetApp, ctx: &egui::Context) {
     editor_window(app, ctx);
     security_window(app, ctx);
     buttons_window(app, ctx);
+    python_settings_window(app, ctx);
 }
 
 fn macros_window(app: &mut SheetApp, ctx: &egui::Context) {
     let Some(mut w) = app.dev.macros.take() else { return };
     let mut open = true;
     let mut close = false;
-    let mut edit: Option<String> = None;
+    let mut edit: Option<(String, String)> = None;
     let mut to_ribbon: Option<String> = None;
     let enabled = gridcraft_engine::cmd::developer::macros_allowed(&app.session);
     egui::Window::new(app.ui.language.tr("Macros"))
@@ -423,6 +472,7 @@ fn macros_window(app: &mut SheetApp, ctx: &egui::Context) {
                 ui.label(RichText::new("Macros are disabled for this workbook. Enable Content in the message bar, or change Macro Security.").weak());
             }
             ui.horizontal(|ui| {
+                provider_picker(ui, "macro_create_provider", &mut w.provider);
                 ui.label("Macro name:");
                 ui.add(egui::TextEdit::singleline(&mut w.new_name).desired_width(260.0));
             });
@@ -434,7 +484,8 @@ fn macros_window(app: &mut SheetApp, ctx: &egui::Context) {
                     }
                     for (i, m) in w.list.iter().enumerate() {
                         let name = m.get("name").and_then(Json::as_str).unwrap_or("");
-                        if ui.selectable_label(i == w.selected, name).clicked() {
+                        let language = m.get("language").and_then(Json::as_str).unwrap_or("");
+                        if ui.selectable_label(i == w.selected, format!("{name} ({language})")).clicked() {
                             w.selected = i;
                             w.new_name = name.to_string();
                         }
@@ -446,17 +497,33 @@ fn macros_window(app: &mut SheetApp, ctx: &egui::Context) {
                 if ui.add_enabled(enabled && chosen.is_some(), egui::Button::new("Run")).clicked()
                     && let Some(name) = &chosen
                 {
-                    match app.session.run("developer.runMacro", json!({"name": name})) {
-                        Ok(_) => close = true,
+                    let plugin = w.list.get(w.selected).and_then(|m| m.get("plugin")).and_then(Json::as_str).unwrap_or("");
+                    // Only Python opts into the new absolute deadline. Existing providers keep
+                    // their synchronous, activity-based timeout and collaboration behaviour.
+                    let command = if provider_language(plugin) == "Python" { "developer.startMacro" } else { "developer.runMacro" };
+                    match app.session.run(command, json!({"name": name, "plugin": plugin})) {
+                        Ok(result) => {
+                            if result["running"] == true {
+                                app.dev.running_macro = Some(name.clone());
+                                app.dev.stopping_macro = false;
+                            }
+                            close = true;
+                        }
                         Err(e) => w.error = Some(e),
                     }
                 }
                 if ui.add_enabled(chosen.is_some(), egui::Button::new("Edit")).clicked()
                     && let Some(m) = w.list.get(w.selected)
                 {
-                    edit = m.get("module").and_then(Json::as_str).map(str::to_string);
+                    edit = m
+                        .get("module")
+                        .and_then(Json::as_str)
+                        .zip(m.get("plugin").and_then(Json::as_str))
+                        .map(|(module, plugin)| (module.to_string(), plugin.to_string()));
                 }
-                if ui.add_enabled(chosen.is_some(), egui::Button::new("Add to Ribbon…")).clicked() {
+                let selected_provider = w.list.get(w.selected).and_then(|m| m.get("plugin")).and_then(Json::as_str);
+                let ribbon_supported = gridcraft_engine::plugin::macro_ribbon_plugins().iter().any(|(id, _)| Some(id.as_str()) == selected_provider);
+                if ui.add_enabled(chosen.is_some() && ribbon_supported, egui::Button::new("Add to Ribbon…")).clicked() {
                     to_ribbon = chosen.clone();
                 }
                 let name = w.new_name.trim().to_string();
@@ -465,13 +532,20 @@ fn macros_window(app: &mut SheetApp, ctx: &egui::Context) {
                     && !name.chars().next().is_some_and(|c| c.is_ascii_digit());
                 if ui
                     .add_enabled(
-                        valid && !w.list.iter().any(|m| m.get("procedure").and_then(Json::as_str) == Some(name.as_str())),
+                        valid
+                            && !w.list.iter().any(|m| {
+                                m.get("plugin").and_then(Json::as_str) == Some(w.provider.as_str())
+                                    && m.get("procedure").and_then(Json::as_str) == Some(name.as_str())
+                            }),
                         egui::Button::new("Create"),
                     )
                     .clicked()
                 {
-                    // A new Sub at the end of Module1, opened in the editor.
-                    edit = Some(create_macro(app, &name, &mut w.error));
+                    // A new procedure in the selected provider's Module1.
+                    match create_macro(app, &name, &w.provider) {
+                        Ok(module) => edit = Some((module, w.provider.clone())),
+                        Err(error) => w.error = Some(error),
+                    }
                 }
                 if ui.button("Close").clicked() {
                     close = true;
@@ -482,8 +556,8 @@ fn macros_window(app: &mut SheetApp, ctx: &egui::Context) {
             }
         });
     app.after_engine();
-    if let Some(module) = edit {
-        open_editor(app, Some(&module));
+    if let Some((module, provider)) = edit {
+        open_editor_for(app, Some(&module), Some(&provider));
         return;
     }
     if let Some(name) = to_ribbon {
@@ -495,29 +569,44 @@ fn macros_window(app: &mut SheetApp, ctx: &egui::Context) {
     }
 }
 
-/// Adds `Sub name()` to Module1 (made when missing); the module's name.
-fn create_macro(app: &mut SheetApp, name: &str, error: &mut Option<String>) -> String {
+/// Adds a language-appropriate procedure to Module1 (made when missing).
+fn create_macro(app: &mut SheetApp, name: &str, provider: &str) -> Result<String, String> {
     let module = "Module1".to_string();
-    let existing = app
-        .session
-        .run("developer.modules", json!({}))
-        .ok()
-        .and_then(|r| r.get("modules").and_then(Json::as_array).cloned())
+    let language = provider_language(provider);
+    if language == "Python" {
+        gridcraft_engine::model::python_macros::validate_module_name(name)?;
+        if name.starts_with('_') {
+            return Err("Macro names must be public Python functions".into());
+        }
+    }
+    let modules = app.session.run("developer.modules", json!({"plugin": provider}))?;
+    let existing = modules
+        .get("modules")
+        .and_then(Json::as_array)
+        .cloned()
         .and_then(|m| m.into_iter().find(|x| x.get("name").and_then(Json::as_str) == Some("Module1")))
         .and_then(|m| m.get("source").and_then(Json::as_str).map(str::to_string))
         .map(|t| format!("{}\r\n\r\n", t.trim_end()))
         .unwrap_or_default();
-    let source = format!("{existing}Sub {name}()\r\n\r\nEnd Sub\r\n");
-    if let Err(e) = app.session.run("developer.saveModule", json!({"name": module, "source": source})) {
-        *error = Some(e);
-    }
-    module
+    let source = procedure_source(&language, &existing, name);
+    app.session.run("developer.saveModule", json!({"plugin": provider, "name": module, "source": source}))?;
+    Ok(module)
+}
+
+fn procedure_source(language: &str, existing: &str, name: &str) -> String {
+    if language == "Python" { format!("{existing}def {name}():\n    pass\n") } else { format!("{existing}Sub {name}()\r\n\r\nEnd Sub\r\n") }
+}
+
+fn module_source(language: &str, name: &str) -> String {
+    if language == "Python" { String::new() } else { format!("Attribute VB_Name = \"{name}\"\r\n") }
 }
 
 fn editor_window(app: &mut SheetApp, ctx: &egui::Context) {
     let Some(mut e) = app.dev.editor.take() else { return };
     let mut open = true;
-    let title = format!("{} — {}", app.ui.language.tr("Visual Basic"), app.session.active().map(|d| d.display_title()).unwrap_or_default());
+    let editor_title = if e.language == "VBA" { app.ui.language.tr("Visual Basic").to_owned() } else { format!("{} Editor", e.language) };
+    let title = format!("{} — {}", editor_title, app.session.active().map(|d| d.display_title()).unwrap_or_default());
+    let mut switch_provider = None;
     egui::Window::new(title)
         .id(egui::Id::new("dev_editor"))
         .collapsible(false)
@@ -526,13 +615,17 @@ fn editor_window(app: &mut SheetApp, ctx: &egui::Context) {
         .open(&mut open)
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
+                let mut provider = e.provider.clone();
+                if ui.add_enabled_ui(!e.dirty, |ui| provider_picker(ui, "editor_provider", &mut provider)).inner {
+                    switch_provider = Some(provider);
+                }
                 if ui
                     .add_enabled(e.dirty, egui::Button::new("Save"))
                     .on_hover_text("Saves the module into the workbook (save the workbook as .xlsm to keep it)")
                     .clicked()
                 {
                     let name = e.modules.get(e.current).map(|(n, _, _)| n.clone()).unwrap_or_else(|| "Module1".into());
-                    match app.session.run("developer.saveModule", json!({"name": name, "source": e.text})) {
+                    match app.session.run("developer.saveModule", json!({"plugin": e.provider, "name": name, "source": e.text})) {
                         Ok(_) => {
                             if let Some(m) = e.modules.get_mut(e.current) {
                                 m.2 = e.text.clone();
@@ -551,8 +644,8 @@ fn editor_window(app: &mut SheetApp, ctx: &egui::Context) {
                 let valid = !e.new_module.trim().is_empty() && !e.modules.iter().any(|(n, _, _)| n.eq_ignore_ascii_case(e.new_module.trim()));
                 if ui.add_enabled(valid, egui::Button::new("Insert Module")).clicked() {
                     let name = e.new_module.trim().to_string();
-                    let source = format!("Attribute VB_Name = \"{name}\"\r\n");
-                    match app.session.run("developer.saveModule", json!({"name": name, "source": source})) {
+                    let source = module_source(&e.language, &name);
+                    match app.session.run("developer.saveModule", json!({"plugin": e.provider, "name": name, "source": source})) {
                         Ok(_) => {
                             e.modules.push((name, "standard".into(), source.clone()));
                             e.current = e.modules.len() - 1;
@@ -563,11 +656,26 @@ fn editor_window(app: &mut SheetApp, ctx: &egui::Context) {
                         Err(err) => e.error = Some(err),
                     }
                 }
+                if e.language == "Python" && ui.button(app.ui.language.tr("Python Settings")).clicked() {
+                    match app.session.run("developer.pythonSettings", json!({})) {
+                        Ok(settings) => {
+                            if let Some(doc) = app.session.active() {
+                                app.dev.python_settings = Some(PythonSettings {
+                                    uid: doc.uid,
+                                    metadata: settings["metadata"].as_str().unwrap_or_default().into(),
+                                    allow_downloads: settings["allowDownloads"] == true,
+                                    error: None,
+                                });
+                            }
+                        }
+                        Err(error) => e.error = Some(error),
+                    }
+                }
                 let standard = e.modules.get(e.current).is_some_and(|(_, k, _)| k == "standard");
                 if ui.add_enabled(standard, egui::Button::new("Remove Module")).clicked()
                     && let Some((name, _, _)) = e.modules.get(e.current).cloned()
                 {
-                    match app.session.run("developer.deleteModule", json!({"name": name})) {
+                    match app.session.run("developer.deleteModule", json!({"plugin": e.provider, "name": name})) {
                         Ok(_) => {
                             e.modules.remove(e.current);
                             e.current = 0;
@@ -578,7 +686,7 @@ fn editor_window(app: &mut SheetApp, ctx: &egui::Context) {
                     }
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.weak(language());
+                    ui.weak(&e.language);
                 });
             });
             if let Some(err) = &e.error {
@@ -628,7 +736,9 @@ fn editor_window(app: &mut SheetApp, ctx: &egui::Context) {
                 });
             });
         });
-    if open {
+    if let Some(provider) = switch_provider {
+        open_editor_for(app, None, Some(&provider));
+    } else if open {
         app.dev.editor = Some(e);
     }
 }
@@ -661,5 +771,82 @@ fn security_window(app: &mut SheetApp, ctx: &egui::Context) {
         });
     if !open {
         app.dev.security = false;
+    }
+}
+
+/// Pumps the shared engine transaction before painting or accepting any other edits.
+pub fn poll_macro(app: &mut SheetApp, ctx: &egui::Context) {
+    if !app.session.macro_running() {
+        return;
+    }
+    match app.session.run("developer.pollMacro", json!({})) {
+        Ok(result) if result["running"] == true => ctx.request_repaint(),
+        result => {
+            app.dev.running_macro = None;
+            app.dev.stopping_macro = false;
+            app.after_engine();
+            if let Err(error) = result {
+                if error.contains("macro cancelled") {
+                    app.toast = Some((app.ui.language.tr("Macro stopped.").into(), crate::now_ms()));
+                } else {
+                    app.message = Some((app.ui.language.tr("Macro").into(), error));
+                }
+            }
+        }
+    }
+}
+
+/// Edits stay disabled until the engine has completed cancellation and rollback.
+pub fn macro_progress(app: &mut SheetApp, ctx: &egui::Context) {
+    let lang = app.ui.language;
+    let t = crate::theme::Tokens::get(ctx);
+    let mut stop = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+    egui::Modal::new(egui::Id::new("macro_progress")).show(ctx, |ui| {
+        ui.set_width(360.0);
+        ui.heading(lang.tr(if app.dev.stopping_macro { "Stopping macro" } else { "Running macro" }));
+        if let Some(name) = &app.dev.running_macro {
+            ui.label(RichText::new(name).color(t.text));
+        }
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.label(lang.tr("Workbook edits are paused until the macro finishes."));
+        });
+        stop |= ui.add_enabled(!app.dev.stopping_macro, egui::Button::new(lang.tr("Stop"))).clicked();
+    });
+    if stop && !app.dev.stopping_macro {
+        match app.session.run("developer.cancelMacro", json!({})) {
+            Ok(_) => app.dev.stopping_macro = true,
+            Err(error) => app.message = Some((lang.tr("Macro").into(), error)),
+        }
+    }
+    ctx.request_repaint();
+}
+
+fn python_settings_window(app: &mut SheetApp, ctx: &egui::Context) {
+    let Some(mut settings) = app.dev.python_settings.take() else { return };
+    if app.session.active().is_none_or(|d| d.uid != settings.uid) {
+        return;
+    }
+    let lang = app.ui.language;
+    let mut open = true;
+    let mut saved = false;
+    egui::Window::new(lang.tr("Python Settings")).id(egui::Id::new("python_project_settings"))
+        .default_width(580.0).collapsible(false).open(&mut open).show(ctx,|ui| {
+            ui.label(lang.tr("PEP 723 interpreter and dependency metadata"));
+            if ui.add(egui::TextEdit::multiline(&mut settings.metadata).code_editor().desired_rows(10).desired_width(f32::INFINITY)).changed() {
+                settings.allow_downloads = false; // New metadata requires fresh approval.
+            }
+            ui.checkbox(&mut settings.allow_downloads,lang.tr("Allow uv to download packages and Python for this metadata in this session"));
+            ui.label(lang.tr("Approval is not saved in the workbook. Without approval, only installed Python and cached dependencies are used. Source builds are disabled."));
+            if let Some(error)=&settings.error { ui.colored_label(ui.visuals().error_fg_color,error); }
+            if ui.button(lang.tr("Save")).clicked() {
+                match app.session.run("developer.setPythonSettings",json!({"metadata":settings.metadata,"allowDownloads":settings.allow_downloads})) {
+                    Ok(_)=>saved=true,
+                    Err(error)=>settings.error=Some(error),
+                }
+            }
+        });
+    if open && !saved {
+        app.dev.python_settings = Some(settings);
     }
 }

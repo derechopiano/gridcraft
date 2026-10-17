@@ -16,12 +16,16 @@ fn main() {
         serve();
         return;
     }
-    let tests: [(&str, fn()); 5] = [
+    let tests: [(&str, fn()); 9] = [
         ("macros_run_as_one_undo_step_and_call_the_host", macros_run_as_one_undo_step_and_call_the_host),
         ("a_failing_macro_changes_nothing", a_failing_macro_changes_nothing),
         ("macro_security_gates_running", macro_security_gates_running),
         ("modules_live_in_the_workbooks_vba_project", modules_live_in_the_workbooks_vba_project),
         ("ribbon_buttons_run_their_macro_and_are_saved", ribbon_buttons_run_their_macro_and_are_saved),
+        ("async_success_and_noop_history", async_success_and_noop_history),
+        ("async_error_stop_and_timeout_rollback", async_error_stop_and_timeout_rollback),
+        ("async_workbook_change_cancels", async_workbook_change_cancels),
+        ("python_download_approval_is_session_and_metadata_bound", python_download_approval_is_session_and_metadata_bound),
     ];
     for (name, t) in tests {
         t();
@@ -71,6 +75,11 @@ fn serve() {
             Some("macros/run") if p["name"] == "Module1.Pressed" => {
                 let text = format!("{}/{}", p["control"]["id"].as_str().unwrap_or("none"), p["control"]["tag"].as_str().unwrap_or(""));
                 host(&mut out, &mut lines, "host/sync", json!({"actions": [{"op": "set", "path": b1, "prop": "values", "value": text}]}));
+                json!({"result": {}})
+            }
+            Some("macros/run") if p["name"] == "Module1.Wait" => {
+                host(&mut out, &mut lines, "host/sync", json!({"actions": [{"op": "set", "path": b1, "prop": "values", "value": 99}]}));
+                std::thread::sleep(std::time::Duration::from_secs(60));
                 json!({"result": {}})
             }
             Some("macros/run") if p["name"] == "Module1.Broken" => {
@@ -201,7 +210,17 @@ fn modules_live_in_the_workbooks_vba_project() {
 }
 
 fn ribbon_buttons_run_their_macro_and_are_saved() {
+    // A Python provider loaded first must not take over Office-style ribbon callbacks.
+    let other = "org.gridcraft.test-python-first";
+    let manifest: gridcraft_engine::plugin::Manifest = serde_json::from_value(json!({
+        "id":other,"name":"Python first","macros":{"language":"Python","recording":false,"ribbonCallbacks":false},
+        "run":{"command":"deliberately-missing-python-provider"}
+    }))
+    .unwrap();
+    gridcraft_engine::plugin::install(manifest, std::env::temp_dir()).unwrap();
     let mut s = session();
+    assert!(s.execute("developer.recordMacro", json!({"plugin":other})).unwrap_err().to_string().contains("does not support recording"));
+    assert!(s.recording.is_none(), "an unsupported recorder must not start recording");
     assert_eq!(s.execute("developer.ribbon", json!({})).unwrap(), json!({"tabs": [], "editable": true}));
     let id = s.execute("developer.addRibbonButton", json!({"macro": "Module1.Pressed", "label": "Go", "tab": "data", "tag": "north"})).unwrap()["id"]
         .as_str()
@@ -243,4 +262,123 @@ fn ribbon_buttons_run_their_macro_and_are_saved() {
     s.execute("edit.undo", json!({})).unwrap();
     assert!(s.active().unwrap().wb.ribbon.as_ref().is_some_and(|r| r.button(&all[all.len() - 1]).is_some()));
     assert!(gridcraft_engine::plugin::unload(PLUGIN));
+    assert!(gridcraft_engine::plugin::unload(other));
+}
+
+#[allow(clippy::disallowed_methods)] // Native process regressions only.
+fn pump_until(s: &mut Session, written: bool) -> gridcraft_engine::Result<Json> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let result = s.execute("developer.pollMacro", json!({}))?;
+        if result["running"] == false || (written && value(s, "B1") == Value::Number(99.0)) {
+            return Ok(result);
+        }
+        assert!(std::time::Instant::now() < deadline, "macro did not make progress");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+fn async_ready() -> Session {
+    let mut s = session();
+    s.execute("cell.set", json!({"cell":"A1","input":"21"})).unwrap();
+    s.execute("cell.set", json!({"cell":"C1","input":"17"})).unwrap();
+    s.execute("edit.undo", json!({})).unwrap();
+    s.execute("developer.enableMacros", json!({})).unwrap();
+    s.journal = (0..10_000).map(|n| ("fixture".into(), json!({"n":n}))).collect();
+    s
+}
+
+fn async_success_and_noop_history() {
+    let mut s = async_ready();
+    assert!(s.execute_headless("developer.startMacro", json!({"name":"Module1.Fill"})).unwrap_err().to_string().contains("developer.runMacro"));
+    assert!(!s.macro_running());
+    let before = s.active().unwrap().clone();
+    let mut expected = s.journal.clone();
+    s.execute("developer.startMacro", json!({"name":"Module1.Fill"})).unwrap();
+    for id in ["cell.set", "file.save", "edit.undo", "plugins.unload", "developer.startMacro"] {
+        assert!(s.execute(id, json!({})).unwrap_err().to_string().contains("macro"), "{id}");
+    }
+    assert_eq!(pump_until(&mut s, false).unwrap()["ran"], "Module1.Fill");
+    assert_eq!(value(&s, "B1"), Value::Number(42.0));
+    assert_eq!(s.active().unwrap().undo.len(), before.undo.len() + 1);
+    assert_eq!(s.active().unwrap().revision, before.revision + 1);
+    expected.push(("developer.runMacro".into(), json!({"name":"Module1.Fill","plugin":PLUGIN})));
+    expected.drain(..5_000);
+    assert_eq!(s.journal, expected, "only the final macro step may trim the bounded journal");
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(value(&s, "B1"), Value::Empty);
+    let before = s.active().unwrap().clone();
+    s.execute("developer.startMacro", json!({"name":"Module1.Nothing"})).unwrap();
+    pump_until(&mut s, false).unwrap();
+    assert!(std::sync::Arc::ptr_eq(&s.active().unwrap().wb, &before.wb));
+    assert_eq!(s.active().unwrap().undo.len(), before.undo.len());
+    assert_eq!(s.active().unwrap().redo.len(), before.redo.len());
+    assert_eq!(s.active().unwrap().revision, before.revision);
+    gridcraft_engine::plugin::unload(PLUGIN);
+}
+
+fn async_error_stop_and_timeout_rollback() {
+    let mut s = async_ready();
+    for mode in ["failure", "stop", "timeout"] {
+        let before = s.active().unwrap().clone();
+        let journal = s.journal.clone();
+        s.execute(
+            "developer.startMacro",
+            json!({"name":if mode=="failure" {"Module1.Broken"} else {"Module1.Wait"},
+            "timeoutMs":if mode=="timeout" {300} else {5000}}),
+        )
+        .unwrap();
+        if mode == "stop" {
+            pump_until(&mut s, true).unwrap();
+            s.execute("developer.cancelMacro", json!({})).unwrap();
+            assert!(s.macro_running(), "cleanup precedes re-enabling edits");
+        }
+        let error = pump_until(&mut s, false).unwrap_err().to_string();
+        let expected = match mode {
+            "failure" => "Subscript",
+            "stop" => "cancelled",
+            _ => "absolute time limit",
+        };
+        assert!(error.contains(expected), "{error}");
+        assert!(std::sync::Arc::ptr_eq(&s.active().unwrap().wb, &before.wb));
+        assert_eq!(s.active().unwrap().revision, before.revision);
+        assert_eq!(s.active().unwrap().undo.len(), before.undo.len());
+        assert_eq!(s.active().unwrap().redo.len(), before.redo.len());
+        assert_eq!(s.active().unwrap().selection, before.selection);
+        assert_eq!(s.journal, journal);
+    }
+    gridcraft_engine::plugin::unload(PLUGIN);
+}
+
+fn async_workbook_change_cancels() {
+    let mut s = async_ready();
+    let original = s.active_index();
+    let before = s.active().unwrap().wb.clone();
+    s.execute("developer.startMacro", json!({"name":"Module1.Wait"})).unwrap();
+    pump_until(&mut s, true).unwrap();
+    s.new_workbook();
+    assert!(!s.macro_running());
+    assert!(std::sync::Arc::ptr_eq(&s.documents()[original].wb, &before));
+    assert_eq!(value(&s, "B1"), Value::Empty);
+    gridcraft_engine::plugin::unload(PLUGIN);
+}
+
+fn python_download_approval_is_session_and_metadata_bound() {
+    let mut s = Session::new();
+    s.new_workbook();
+    let metadata = s.execute("developer.pythonSettings", json!({})).unwrap()["metadata"].as_str().unwrap().to_string();
+    s.execute("developer.setPythonSettings", json!({"metadata":metadata,"allowDownloads":true})).unwrap();
+    assert_eq!(s.execute("developer.pythonSettings", json!({})).unwrap()["allowDownloads"], true);
+    let wb = s.active().unwrap().wb.clone();
+    let encoded = serde_json::to_string(&wb.python_macros).unwrap();
+    assert!(!encoded.contains("allowDownloads"), "a workbook cannot carry download consent");
+    let changed = metadata.replace(">=3.11", ">=3.12");
+    gridcraft_engine::cmd::developer::host_call(&mut s, "fixture", "host/pythonProject/set", &json!({"project":{"metadata":changed,"modules":{}}}))
+        .unwrap();
+    assert_eq!(s.execute("developer.pythonSettings", json!({})).unwrap()["allowDownloads"], false);
+    s.new_workbook();
+    assert_eq!(s.execute("developer.pythonSettings", json!({})).unwrap()["allowDownloads"], false);
+    let before = s.active().unwrap().wb.clone();
+    assert!(s.execute("developer.setPythonSettings", json!({"metadata":"print('untrusted')","allowDownloads":true})).is_err());
+    assert!(std::sync::Arc::ptr_eq(&before, &s.active().unwrap().wb));
 }

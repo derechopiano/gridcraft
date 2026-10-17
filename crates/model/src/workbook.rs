@@ -87,6 +87,9 @@ pub struct DocProps {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Workbook {
+    /// Workbook Python macro source, never execution permission or runtime state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub python_macros: Option<Arc<crate::PythonMacroProject>>,
     pub sheets: Vec<Arc<Sheet>>,
     pub names: Vec<DefinedName>,
     pub styles: StyleTable,
@@ -144,6 +147,7 @@ impl Workbook {
     /// A new workbook with one sheet, "Sheet1".
     pub fn new() -> Workbook {
         Workbook {
+            python_macros: None,
             sheets: vec![Arc::new(Sheet::new("Sheet1"))],
             names: vec![],
             styles: StyleTable::default(),

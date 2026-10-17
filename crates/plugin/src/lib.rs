@@ -17,6 +17,8 @@
 pub mod dialog;
 pub mod events;
 pub mod install;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod macro_call;
 pub mod office;
 mod process;
 pub mod push;
@@ -33,7 +35,7 @@ use gridcraft_core::{CellError, Value};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as Json, json};
 
-pub use process::{Connection, HostError, HostHandler, Notifier, RequestError};
+pub use process::{Connection, HostError, HostHandler, Notifier, RequestControl, RequestError};
 
 /// The protocol version this host speaks (sent in `initialize`).
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -46,6 +48,7 @@ pub const PROTOCOL: &str = "2.2";
 /// (protocol 1.2); the push channel and co-editing (protocol 2); the calling workbook in
 /// `functions/call`, `documentOpened` before the opening recalculation, multi-line form fields,
 /// blank results, literal text in `range.setValues` and `host/functions/invalidate` (2.2).
+/// Local Python integration additionally proposes workbook projects and engine commands.
 pub const FEATURES: &[&str] = &[
     "dialogs",
     "open",
@@ -59,6 +62,8 @@ pub const FEATURES: &[&str] = &[
     "emptyResult",
     "literalValues",
     "invalidate",
+    "pythonProjects",
+    "engineCommands",
 ];
 /// This app's id in a manifest's `apps` and `uiFor`, and in `initialize`'s `host.id`. The
 /// manifest and protocol are shared with the other craft apps (WordCraft), so one plugin can
@@ -100,7 +105,7 @@ pub struct Manifest {
     pub homepage: String,
     #[serde(default)]
     pub author: String,
-    /// The apps the plugin is made for (`gridcraft`, `wordcraft`, …); empty: any.
+    /// The apps the plugin is made for (`gridcraft`, `wordcraft`, ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦); empty: any.
     #[serde(default)]
     pub apps: Vec<String>,
     /// The program to start; empty for an Office add-in, whose commands open its task pane.
@@ -114,7 +119,7 @@ pub struct Manifest {
     /// manifest has one, else `ui`.
     #[serde(default)]
     pub ui: UiDecl,
-    /// Per-app ribbon groups and menu items (`{"gridcraft": {…}, "wordcraft": {…}}`), as written.
+    /// Per-app ribbon groups and menu items (`{"gridcraft": {ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦}, "wordcraft": {ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦}}`), as written.
     #[serde(default)]
     pub ui_for: std::collections::BTreeMap<String, Json>,
     /// A scripting language the plugin runs macros in (protocol 1.1: `macros/*`), e.g. VBA.
@@ -139,7 +144,7 @@ pub struct Manifest {
 /// A transport plugin's declaration (protocol 2).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct CollabDecl {
-    /// The kind of transport (`mqtt`, `loopback`, `y-websocket`…).
+    /// The kind of transport (`mqtt`, `loopback`, `y-websocket`ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦).
     pub transport: String,
     /// What the Share menus call it.
     #[serde(default)]
@@ -151,6 +156,11 @@ pub struct CollabDecl {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct MacrosDecl {
     pub language: String,
+    /// Older providers support recording and Office ribbon callbacks by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recording: Option<bool>,
+    #[serde(default, rename = "ribbonCallbacks", skip_serializing_if = "Option::is_none")]
+    pub ribbon_callbacks: Option<bool>,
 }
 
 /// How to start the plugin. A `command` containing a path separator is relative to the plugin
@@ -205,7 +215,7 @@ pub struct CommandDecl {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UiDecl {
-    /// Groups of buttons on a ribbon tab: an existing tab (`Home`, `Data`, …) or a new one.
+    /// Groups of buttons on a ribbon tab: an existing tab (`Home`, `Data`, ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦) or a new one.
     #[serde(default)]
     pub ribbon: Vec<RibbonGroupDecl>,
     /// Items added to a right-click menu.
@@ -333,7 +343,7 @@ impl Manifest {
 
     fn validate(&self, office: bool) -> Result<(), String> {
         if !valid_id(&self.id) {
-            return Err(format!("{MANIFEST}: id `{}` must be 1–128 letters, digits, `.`, `-` or `_`", self.id));
+            return Err(format!("{MANIFEST}: id `{}` must be 1ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Å“128 letters, digits, `.`, `-` or `_`", self.id));
         }
         if self.name.trim().is_empty() {
             return Err(format!("{MANIFEST}: `name` is empty"));
@@ -352,7 +362,7 @@ impl Manifest {
         if let Some(c) = &self.collab
             && (c.transport.trim().is_empty() || c.transport.len() > 64 || c.label.chars().count() > MAX_LABEL)
         {
-            return Err(format!("{MANIFEST}: `collab.transport` needs 1–64 characters and `collab.label` at most {MAX_LABEL}"));
+            return Err(format!("{MANIFEST}: `collab.transport` needs 1ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Å“64 characters and `collab.label` at most {MAX_LABEL}"));
         }
         self.requires.validate(&self.id)?;
         if self.events.len() > MAX_DECLARATIONS {
@@ -370,7 +380,7 @@ impl Manifest {
                 return Err(format!("{MANIFEST}: function `{}` is declared twice", f.name));
             }
             if f.min_args > f.max_args || f.max_args > 255 {
-                return Err(format!("{MANIFEST}: function `{}` needs minArgs ≤ maxArgs ≤ 255", f.name));
+                return Err(format!("{MANIFEST}: function `{}` needs minArgs ÃƒÂ¢Ã¢â‚¬Â°Ã‚Â¤ maxArgs ÃƒÂ¢Ã¢â‚¬Â°Ã‚Â¤ 255", f.name));
             }
         }
         let mut seen = std::collections::HashSet::new();
@@ -391,7 +401,7 @@ impl Manifest {
         };
         for g in &self.ui.ribbon {
             if !valid_label(&g.tab) || !valid_label(&g.group) {
-                return Err(format!("{MANIFEST}: ribbon `tab` and `group` need 1–{MAX_LABEL} characters"));
+                return Err(format!("{MANIFEST}: ribbon `tab` and `group` need 1ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Å“{MAX_LABEL} characters"));
             }
             if g.buttons.is_empty() {
                 return Err(format!("{MANIFEST}: ribbon group `{}` has no buttons", g.group));
@@ -399,14 +409,14 @@ impl Manifest {
             for b in &g.buttons {
                 known(&b.command, &format!("a button in ribbon group `{}`", g.group))?;
                 if b.label.as_deref().is_some_and(|l| !valid_label(l)) {
-                    return Err(format!("{MANIFEST}: button labels need 1–{MAX_LABEL} characters"));
+                    return Err(format!("{MANIFEST}: button labels need 1ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Å“{MAX_LABEL} characters"));
                 }
             }
         }
         for item in &self.ui.menus {
             known(&item.command, "a menu item")?;
             if item.label.as_deref().is_some_and(|l| !valid_label(l)) {
-                return Err(format!("{MANIFEST}: menu item labels need 1–{MAX_LABEL} characters"));
+                return Err(format!("{MANIFEST}: menu item labels need 1ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Å“{MAX_LABEL} characters"));
             }
         }
         Ok(())
@@ -433,6 +443,7 @@ pub struct Plugin {
     pub manifest: Manifest,
     pub dir: PathBuf,
     state: Mutex<(State, u32)>,
+    macro_in_flight: std::sync::atomic::AtomicBool,
     /// Results of non-volatile functions by name, arguments and calling workbook: the value, and
     /// whether it holds explicit blanks.
     cache: Mutex<HashMap<String, (Value, bool)>>,
@@ -467,6 +478,7 @@ impl Plugin {
         Plugin {
             manifest,
             state: Mutex::new((State::Idle, 0)),
+            macro_in_flight: std::sync::atomic::AtomicBool::new(false),
             cache: Mutex::new(HashMap::new()),
             enabled: std::sync::atomic::AtomicBool::new(true),
             source: install::read_source(&dir),
@@ -512,7 +524,7 @@ impl Plugin {
 
     /// Starts the required add-ins that aren't running yet, before this one starts (they start
     /// first). Nothing to do when this one is already running or busy.
-    fn start_requirements(&self) -> Result<(), String> {
+    fn start_requirements_controlled(&self, control: Option<&RequestControl>) -> Result<(), String> {
         if self.manifest.requires.addins.is_empty() || !self.enabled() {
             return Ok(());
         }
@@ -529,7 +541,8 @@ impl Plugin {
             if dep.manifest.office.is_some() || BUSY.with(|b| b.borrow().contains(&dep.manifest.id)) {
                 continue;
             }
-            dep.ensure_running().map_err(|e| format!("{} needs {}, which couldn't start: {e}", self.manifest.id, dep.manifest.name))?;
+            dep.ensure_running_controlled(control)
+                .map_err(|e| format!("{} needs {}, which couldn't start: {e}", self.manifest.id, dep.manifest.name))?;
         }
         Ok(())
     }
@@ -539,18 +552,35 @@ impl Plugin {
         self.request_with(method, params, timeout, &mut |_, _| Err(HostError::unknown()))
     }
 
-    /// [`Plugin::request`], answering the plugin's `host/…` requests with `host` meanwhile.
+    /// [`Plugin::request`], answering the plugin's `host/ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦` requests with `host` meanwhile.
     fn request_with(&self, method: &str, params: Json, timeout: Duration, host: &mut HostHandler<'_>) -> Result<Json, String> {
+        self.request_controlled(method, params, timeout, host, None)
+    }
+
+    fn request_controlled(
+        &self,
+        method: &str,
+        params: Json,
+        timeout: Duration,
+        host: &mut HostHandler<'_>,
+        control: Option<&RequestControl>,
+    ) -> Result<Json, String> {
+        if control.is_none() && self.macro_in_flight.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(format!("plugin {} is busy", self.manifest.id));
+        }
+        if let Some(control) = control {
+            control.remaining().map_err(|e| e.message)?;
+        }
         // A host request of this plugin's (a macro writing cells) can recalculate a formula that
         // calls the plugin again: that waits for nobody, it fails (the cell shows #VALUE!).
         if BUSY.with(|b| b.borrow().contains(&self.manifest.id)) {
             return Err(format!("plugin {} is busy", self.manifest.id));
         }
         self.check_blocked()?;
-        self.start_requirements()?;
+        self.start_requirements_controlled(control)?;
         let was_failed = self.failed();
         BUSY.with(|b| b.borrow_mut().push(self.manifest.id.clone()));
-        let r = self.request_inner(method, params, timeout, host);
+        let r = self.request_inner(method, params, timeout, host, control);
         BUSY.with(|b| {
             let mut b = b.borrow_mut();
             if let Some(i) = b.iter().rposition(|x| *x == self.manifest.id) {
@@ -564,11 +594,18 @@ impl Plugin {
         r
     }
 
-    fn request_inner(&self, method: &str, params: Json, timeout: Duration, host: &mut HostHandler<'_>) -> Result<Json, String> {
+    fn request_inner(
+        &self,
+        method: &str,
+        params: Json,
+        timeout: Duration,
+        host: &mut HostHandler<'_>,
+        control: Option<&RequestControl>,
+    ) -> Result<Json, String> {
         if self.manifest.office.is_some() {
             return Err(format!("{} is an Office add-in: it runs in its task pane", self.manifest.id));
         }
-        let mut guard = lock(&self.state);
+        let mut guard = self.lock_state(control)?;
         // Checked under the lock: turning off stores the flag, then stops the process under it.
         if !self.enabled() {
             return Err(format!("plugin {} is turned off", self.manifest.id));
@@ -579,7 +616,7 @@ impl Plugin {
             return Err(why.clone());
         }
         if !matches!(state, State::Running(_)) {
-            match self.start(failures) {
+            match self.start_controlled(failures, control) {
                 Ok(conn) => {
                     *lock(&self.notifier) = conn.sender();
                     *state = State::Running(conn);
@@ -594,10 +631,20 @@ impl Plugin {
             }
         }
         let State::Running(conn) = state else { return Err("plugin not running".into()) };
-        match conn.request_with(method, params, timeout, host) {
+        let reply = match control {
+            Some(control) => conn.request_with_control(method, params, timeout, host, control),
+            None => conn.request_with(method, params, timeout, host),
+        };
+        match reply {
             Ok(v) => Ok(v),
             Err(e) if e.fatal => {
                 // The connection is gone or out of step: stop the process and start afresh next time.
+                // A deliberate Stop invalidates the connection, not the provider's health.
+                if control.is_some_and(RequestControl::is_cancelled) {
+                    *state = State::Idle;
+                    *lock(&self.notifier) = None;
+                    return Err(e.message);
+                }
                 *failures += 1;
                 log::warn!("plugin {}: {} (failure {failures} of {MAX_FAILURES})", self.manifest.id, e.message);
                 *state =
@@ -612,8 +659,29 @@ impl Plugin {
         }
     }
 
+    fn lock_state(&self, control: Option<&RequestControl>) -> Result<MutexGuard<'_, (State, u32)>, String> {
+        let Some(control) = control else { return Ok(lock(&self.state)) };
+        #[cfg(not(target_arch = "wasm32"))]
+        loop {
+            control.remaining().map_err(|e| e.message)?;
+            match self.state.try_lock() {
+                Ok(guard) => return Ok(guard),
+                Err(std::sync::TryLockError::Poisoned(error)) => return Ok(error.into_inner()),
+                Err(std::sync::TryLockError::WouldBlock) => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = control;
+            Err("plugins need the desktop app or the CLI".into())
+        }
+    }
+
     /// Starts the process and sends `initialize`. A failure counts.
-    fn start(&self, failures: &mut u32) -> Result<Connection, String> {
+    fn start_controlled(&self, failures: &mut u32, control: Option<&RequestControl>) -> Result<Connection, String> {
+        if let Some(control) = control {
+            control.remaining().map_err(|e| e.message)?;
+        }
         let mut conn = Connection::start(&self.manifest, &self.dir)?;
         let mut host_info =
             json!({"id": HOST_ID, "name": "GridCraft", "version": env!("CARGO_PKG_VERSION"), "protocol": PROTOCOL, "features": FEATURES});
@@ -636,8 +704,14 @@ impl Plugin {
                 "id": p.manifest.id, "version": p.manifest.version, "enabled": p.active() && !p.failed(),
             })).collect::<Vec<_>>(),
         });
-        if let Err(e) = conn.request("initialize", init, INIT_TIMEOUT) {
-            *failures += 1;
+        let reply = match control {
+            Some(control) => conn.request_with_control("initialize", init, INIT_TIMEOUT, &mut |_, _| Err(HostError::unknown()), control),
+            None => conn.request("initialize", init, INIT_TIMEOUT),
+        };
+        if let Err(e) = reply {
+            if !control.is_some_and(RequestControl::is_cancelled) {
+                *failures += 1;
+            }
             return Err(e.message);
         }
         Ok(conn)
@@ -646,21 +720,25 @@ impl Plugin {
     /// Starts the process when it isn't running (protocol 2: a transport runs while it's in a
     /// room, not only during calls).
     pub fn ensure_running(&self) -> Result<(), String> {
+        self.ensure_running_controlled(None)
+    }
+
+    fn ensure_running_controlled(&self, control: Option<&RequestControl>) -> Result<(), String> {
         if self.manifest.office.is_some() {
             return Err(format!("{} is an Office add-in: it runs in its task pane", self.manifest.id));
         }
         self.check_blocked()?;
-        self.start_requirements()?;
+        self.start_requirements_controlled(control)?;
         let was_failed = self.failed();
-        let r = self.ensure_running_inner();
+        let r = self.ensure_running_inner(control);
         if self.failed() != was_failed {
             refresh();
         }
         r
     }
 
-    fn ensure_running_inner(&self) -> Result<(), String> {
-        let mut guard = lock(&self.state);
+    fn ensure_running_inner(&self, control: Option<&RequestControl>) -> Result<(), String> {
+        let mut guard = self.lock_state(control)?;
         if !self.enabled() {
             return Err(format!("plugin {} is turned off", self.manifest.id));
         }
@@ -668,7 +746,7 @@ impl Plugin {
         match state {
             State::Running(_) => Ok(()),
             State::Failed(why) => Err(why.clone()),
-            State::Idle => match self.start(failures) {
+            State::Idle => match self.start_controlled(failures, control) {
                 Ok(conn) => {
                     *lock(&self.notifier) = conn.sender();
                     *state = State::Running(conn);
@@ -800,7 +878,7 @@ impl Plugin {
         }
     }
 
-    /// `ready` (not started), `running`, or `failed: …`.
+    /// `ready` (not started), `running`, or `failed: ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦`.
     /// False once turned off with [`set_enabled`].
     pub fn enabled(&self) -> bool {
         self.enabled.load(std::sync::atomic::Ordering::Relaxed)
@@ -812,6 +890,9 @@ impl Plugin {
         }
         if let Some(b) = lock(&self.blocked).first() {
             return format!("blocked: {}", b.message);
+        }
+        if self.macro_in_flight.load(std::sync::atomic::Ordering::SeqCst) {
+            return "running".into();
         }
         match &lock(&self.state).0 {
             State::Idle => "ready".into(),
@@ -1367,11 +1448,11 @@ pub fn run_command(plugin_id: &str, command: &str, params: Json, context: Json) 
     run_command_with(plugin_id, command, params, context, &mut |_, _| Err(HostError::unknown()))
 }
 
-/// [`run_command`], answering the plugin's `host/…` requests with `host` while it runs.
+/// [`run_command`], answering the plugin's `host/ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦` requests with `host` while it runs.
 pub fn run_command_with(plugin_id: &str, command: &str, params: Json, context: Json, host: &mut HostHandler<'_>) -> Result<CommandReply, String> {
     let plugin = get(plugin_id).ok_or_else(|| format!("no plugin `{plugin_id}` is loaded"))?;
     if !plugin.enabled() {
-        return Err(format!("plugin {plugin_id} is turned off (File › Options › Add-ins)"));
+        return Err(format!("plugin {plugin_id} is turned off (File ÃƒÂ¢Ã¢â€šÂ¬Ã‚Âº Options ÃƒÂ¢Ã¢â€šÂ¬Ã‚Âº Add-ins)"));
     }
     plugin.check_blocked()?;
     if !plugin.manifest.commands.iter().any(|c| c.id == command) {
@@ -1392,12 +1473,12 @@ pub fn run_command_with(plugin_id: &str, command: &str, params: Json, context: J
     Ok(reply)
 }
 
-/// Sends a macro plugin one of its `macros/…` requests (protocol 1.1), answering its `host/…`
+/// Sends a macro plugin one of its `macros/ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦` requests (protocol 1.1), answering its `host/ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦`
 /// requests with `host` meanwhile.
 pub fn call_macros(plugin_id: &str, method: &str, params: Json, host: &mut HostHandler<'_>) -> Result<Json, String> {
     let plugin = get(plugin_id).ok_or_else(|| format!("no plugin `{plugin_id}` is loaded"))?;
     if !plugin.enabled() {
-        return Err(format!("plugin {plugin_id} is turned off (File › Options › Add-ins)"));
+        return Err(format!("plugin {plugin_id} is turned off (File ÃƒÂ¢Ã¢â€šÂ¬Ã‚Âº Options ÃƒÂ¢Ã¢â€šÂ¬Ã‚Âº Add-ins)"));
     }
     plugin.check_blocked()?;
     if plugin.manifest.macros.is_none() || !method.starts_with("macros/") {
@@ -1413,10 +1494,24 @@ pub fn transports() -> Vec<Arc<Plugin>> {
 
 /// The active plugins that run macros, with their language.
 pub fn macro_plugins() -> Vec<(String, String)> {
+    macro_plugins_for(|_| true)
+}
+
+/// Macro providers that can translate recorded commands into source.
+pub fn macro_recording_plugins() -> Vec<(String, String)> {
+    macro_plugins_for(|m| m.recording != Some(false))
+}
+
+/// Macro providers that accept Office-style workbook ribbon callbacks.
+pub fn macro_ribbon_plugins() -> Vec<(String, String)> {
+    macro_plugins_for(|m| m.ribbon_callbacks != Some(false))
+}
+
+fn macro_plugins_for(supports: fn(&MacrosDecl) -> bool) -> Vec<(String, String)> {
     list()
         .into_iter()
         .filter(|p| p.active())
-        .filter_map(|p| p.manifest.macros.as_ref().map(|m| (p.manifest.id.clone(), m.language.clone())))
+        .filter_map(|p| p.manifest.macros.as_ref().filter(|m| supports(m)).map(|m| (p.manifest.id.clone(), m.language.clone())))
         .collect()
 }
 

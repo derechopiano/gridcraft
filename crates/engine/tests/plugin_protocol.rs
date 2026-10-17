@@ -173,7 +173,9 @@ fn initialize_announces_features_and_language(_dir: &std::path::Path) {
             "multiline",
             "emptyResult",
             "literalValues",
-            "invalidate"
+            "invalidate",
+            "pythonProjects",
+            "engineCommands"
         ])
     );
     assert_eq!(host["protocol"], "2.2");

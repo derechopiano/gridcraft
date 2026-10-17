@@ -137,6 +137,20 @@ pub fn read_xlsx(bytes: &[u8]) -> Result<(Workbook, ReadReport), IoError> {
         }
     };
     let mut wb = Workbook::new();
+    let projects: Vec<_> = wb_rels.iter().filter(|r| r.kind == "pythonMacroProject").collect();
+    if projects.len() > 1 {
+        return Err(IoError::Format("multiple Python macro projects in one workbook".into()));
+    }
+    if let Some(rel) = projects.first() {
+        if rel.external {
+            return Err(IoError::Format("external Python macro project relationships are not supported".into()));
+        }
+        let bytes = cx
+            .pkg
+            .read_limited(&rel.target, crate::python_macros::MAX_PART_BYTES)?
+            .ok_or_else(|| IoError::Format("missing Python macro project part".into()))?;
+        wb.python_macros = Some(crate::python_macros::read(&bytes)?);
+    }
     wb.sheets.clear();
 
     // Styles and theme. Cell checkboxes live in the feature property bags, which styles refer to.

@@ -769,6 +769,9 @@ impl Session {
     /// milliseconds (the engine reads no clock: it would trap in the browser). Returns whether
     /// anything changed that the interface should show.
     pub fn collab_poll(&mut self, now: u64) -> bool {
+        if self.macro_running() {
+            return false;
+        } // Leave pushes queued until the transaction ends.
         let pushed = gridcraft_plugin::push::take();
         self.collab_poll_pushed(now, pushed)
     }
@@ -776,6 +779,11 @@ impl Session {
     /// [`Session::collab_poll`] with the messages given (several sessions in one process share
     /// the plugins' queue: the caller splits it; [`IN_MEMORY`] rooms get theirs this way).
     pub fn collab_poll_pushed(&mut self, now: u64, pushed: Vec<Pushed>) -> bool {
+        // A caller that already took messages cannot put them back: cancel before applying,
+        // so remote/plugin changes are never overwritten by rollback or silently dropped.
+        if !pushed.is_empty() {
+            self.abort_macro_before_document_change();
+        }
         self.collab.now = now;
         let mut changed = false;
         for p in pushed {

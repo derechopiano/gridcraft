@@ -1,6 +1,6 @@
 # File-format parity
 
-> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-14 · **Change:** trivial (formulas over Excel's 8,192 characters, and `%` or call chains past the nesting limit, are parse errors instead of stack overflows when a file is opened; previously trivial: XLSX chart sheets are kept on save (#727)) · **Target:** Microsoft Excel (Microsoft 365), Excel for Mac 16.113.4
+> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-17 · **Change:** minor (versioned Python workbook-project part; VBA preserved independently) · **Target:** Microsoft Excel (Microsoft 365), Excel for Mac 16.113.4
 
 Every format Excel opens or saves, with GridCraft's read and write support, fidelity and tests.
 Part of [target-app-parity.md](target-app-parity.md). **File formats: ~50% ready, 80–120 h**
@@ -82,10 +82,19 @@ refresh. Counted under features (Get & Transform, ~10% ready), not here.
 | CSV/text: encoding choice, `.prn`, `.dif`, `.slk`, XML Spreadsheet 2003 | 4–7 |
 | PDF: embed subsetted system fonts so every script exports | (counted in [localization](localization-parity.md) script work) |
 
+## Python workbook-project extension
+
+Optional Python source is stored in a bounded, versioned `/xl/gridcraft/pythonMacros.json` part,
+independently of VBA. Reads validate names, sizes and schema version before accepting it;
+malformed/unsupported projects fail rather than execute. Download approval is not serialized.
+Round-trip tests use synthetic workbooks. Excel cannot execute these Python projects; this is
+an application extension, not Excel file-feature parity. See [python-macro-integration.md](python-macro-integration.md).
+
 ## Revision history
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-17 | minor | versioned Python workbook-project part; VBA preserved independently |
 | 2026-10-16 | minor | The document chat's part (`/craft/chat.json`) is read and written in every OOXML kind, and the native JSON format keeps the chat |
 | 2026-10-14 | minor | The workbook's ribbon part (`customUI14.xml`) is read and written when it is tabs, groups and macro buttons; a workbook with macros saved under an `.xlsx` name is saved as `.xlsm` |
 | 2026-10-14 | trivial | Formula parser: text longer than Excel's 8,192 characters, and postfix chains (`1%%%…`, `f(1)(1)…`) past the 256-level nesting limit, are parse errors (the cell keeps its formula text and cached value) instead of trees deep enough to overflow the stack when a hostile file is opened, saved or dropped |

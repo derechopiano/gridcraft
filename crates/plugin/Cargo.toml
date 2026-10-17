@@ -31,3 +31,9 @@ doc = false
 
 [dev-dependencies]
 gridcraft-model = { workspace = true }
+
+# Real-process cancellation/deadline fixtures run without external Python.
+[[test]]
+name = "macro_control"
+path = "tests/macro_control.rs"
+harness = false

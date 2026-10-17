@@ -224,6 +224,10 @@ pub fn write_xlsx(wb: &Workbook, kind: XlsxKind) -> Result<Vec<u8>, IoError> {
     };
 
     let mut wb_rels = Rels::default();
+    if let Some(bytes) = crate::python_macros::write(wb)? {
+        out.part("xl/gridcraft/pythonMacros.json", Some(crate::python_macros::CONTENT_TYPE), bytes);
+        wb_rels.add_uri(crate::python_macros::REL, "gridcraft/pythonMacros.json");
+    }
     // Kept content first: the chart sheets among the worksheets need their relationship ids.
     let kept = crate::passthrough::write_workbook(wb, &mut wb_rels, &mut out);
     let mut pivots = crate::pivot::PivotWriter::default();

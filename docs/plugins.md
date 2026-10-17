@@ -1,6 +1,6 @@
 # Plugins
 
-> **Last reviewed:** 2026-10-16 · **Last updated:** 2026-10-16 · **Change:** minor (protocol 2.2: functions know their workbook, `documentOpened` before the opening calculation, multi-line form fields, blank results, literal text, invalidation; previously minor: manifest 1.3: add-ins that require other add-ins, with version ranges; previously minor: protocol 2: the push channel and co-editing transports; previously minor: protocol 1.2: host-drawn dialogs, opening files, document events, `context.document`; previously minor: commands see the workbook's sheets and names; previously minor: commands see the selection's formulas; previously minor: plugin functions in autocomplete and Insert Function; previously minor: ribbon buttons that run macros; previously minor: protocol 1.1: host requests, macros and the Developer tab) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-10-16 · **Last updated:** 2026-10-17 · **Change:** minor (additive workbook Python capabilities and cancellable macro lifecycle) · **Target:** Microsoft Excel (Microsoft 365)
 
 A plugin adds **functions** that formulas call and **commands** the user (or an agent) runs,
 and can put its commands on the ribbon (a group on a built-in tab, or a tab of its own) and in
@@ -677,10 +677,28 @@ are kept.
 - Workbooks don't record which plugin a formula needs. Without the plugin, its cells show
   `#NAME?` after a recalculation. In XLSX, the formula text is kept as written.
 
+## Optional workbook Python project capabilities
+
+The proposed `pythonProjects` and `engineCommands` features extend protocol 2.2 without
+removing existing capabilities. They expose validated project get/set and a restricted engine
+command bridge through the shared macro transaction. Macros may declare `recording:false`
+and `ribbonCallbacks:false`; omitted flags preserve existing VBA behavior.
+
+Native `developer.startMacro/pollMacro/cancelMacro` adds bounded, cancellable background
+transport while Session work stays on the owner thread. Ordinary request activity timeouts
+remain unchanged; asynchronous macro runs have an absolute budget, reject conflicting edits,
+and roll back on Stop/error/timeout. Live collaboration is excluded from the async path.
+Headless callers and the existing non-Python UI Run path use synchronous `developer.runMacro`; only Python opts into the new UI lifecycle.
+
+The optional provider extends craft-python 0.3.0 instead of replacing its scripting dispatcher.
+See [python-macro-integration.md](python-macro-integration.md) for installation, APIs, limits,
+download consent and the separate provider identity.
+
 ## Revision history
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-17 | minor | additive workbook Python capabilities and cancellable macro lifecycle |
 | 2026-10-16 | minor | Protocol 2.2: `functions/call` carries `document {path, name, id}` (results kept per workbook), `id` in `context.document` and the document events, `documentOpened` before an opened workbook's first calculation (at most 10 s per plugin), multi-line and code form fields, `{"empty": true}` blank results (`null` stays 0, as in Excel), `range.setValues {literal: true}`, `host/functions/invalidate`; `host.features` `functionDocument`, `openedBeforeCalc`, `multiline`, `emptyResult`, `literalValues`, `invalidate` |
 | 2026-10-15 | minor | Manifest 1.3: `requires` (apps, protocol, features, other add-ins with Cargo-style version ranges), blocked add-ins (`state`, `blockedBy`, `requiredBy`), start order, `host.protocol` and `addins` in `initialize`, `plugins.requirements`, `plugins.installMissing`, `plugins.install` `withRequirements`/`force`/`version` (newest release in range), Install Missing, asking before turning off a needed add-in or updating out of range; Office add-ins' requirement sets |
 | 2026-10-15 | minor | Protocol 2: the push channel (plugins speak any time; `host.features` `push`, `collab`; `host.collab`), manifest `collab` (transports), `collab.join` in command results; co-editing in [collab.md](collab.md) |

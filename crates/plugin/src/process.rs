@@ -17,6 +17,48 @@ pub struct RequestError {
     pub fatal: bool,
 }
 
+/// Cancellation and an absolute budget for one native macro operation.
+/// Clone the handle for a Stop control; cancelling never takes the plugin state mutex.
+/// Existing requests keep their activity-based timeout unless they opt into this control.
+#[derive(Clone)]
+pub struct RequestControl {
+    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    budget: Duration,
+    #[cfg(not(target_arch = "wasm32"))]
+    started: std::time::Instant,
+}
+
+impl RequestControl {
+    #[allow(clippy::disallowed_methods)] // Native clock only; web plugins cannot start.
+    pub fn new(budget: Duration) -> Self {
+        Self {
+            cancelled: Default::default(),
+            budget,
+            #[cfg(not(target_arch = "wasm32"))]
+            started: std::time::Instant::now(),
+        }
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub(crate) fn remaining(&self) -> Result<Duration, RequestError> {
+        if self.is_cancelled() {
+            return Err(RequestError::fatal("macro cancelled"));
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        let left = self.budget.saturating_sub(self.started.elapsed());
+        #[cfg(target_arch = "wasm32")]
+        let left = self.budget;
+        if left.is_zero() { Err(RequestError::fatal("macro exceeded its absolute time limit")) } else { Ok(left) }
+    }
+}
+
 /// The host's answer to a plugin's request (protocol 1.1): `Ok(result)` or an error.
 pub type HostHandler<'a> = dyn FnMut(&str, &Json) -> Result<Json, HostError> + 'a;
 
@@ -76,6 +118,17 @@ mod web {
             Err(RequestError::fatal("plugins need the desktop app or the CLI"))
         }
         pub fn request_with(&mut self, _method: &str, _params: Json, _timeout: Duration, _host: &mut HostHandler<'_>) -> Result<Json, RequestError> {
+            Err(RequestError::fatal("plugins need the desktop app or the CLI"))
+        }
+        pub fn request_with_control(
+            &mut self,
+            _method: &str,
+            _params: Json,
+            _timeout: Duration,
+            _host: &mut HostHandler<'_>,
+            control: &RequestControl,
+        ) -> Result<Json, RequestError> {
+            control.remaining()?;
             Err(RequestError::fatal("plugins need the desktop app or the CLI"))
         }
         pub fn shutdown(self) {}
@@ -264,8 +317,31 @@ mod native {
         /// with `host` while it works. Each answer starts the timeout again: a macro that keeps
         /// calling the host is working, not hung.
         pub fn request_with(&mut self, method: &str, params: Json, timeout: Duration, host: &mut HostHandler<'_>) -> Result<Json, RequestError> {
+            self.request_controlled(method, params, timeout, host, None)
+        }
+
+        /// Uses the same transport, with cancellation and a budget that host traffic cannot extend.
+        pub fn request_with_control(
+            &mut self,
+            method: &str,
+            params: Json,
+            timeout: Duration,
+            host: &mut HostHandler<'_>,
+            control: &RequestControl,
+        ) -> Result<Json, RequestError> {
+            self.request_controlled(method, params, timeout, host, Some(control))
+        }
+
+        fn request_controlled(
+            &mut self,
+            method: &str,
+            params: Json,
+            timeout: Duration,
+            host: &mut HostHandler<'_>,
+            control: Option<&RequestControl>,
+        ) -> Result<Json, RequestError> {
             self.in_request.store(true, Ordering::SeqCst);
-            let r = self.request_inner(method, params, timeout, host);
+            let r = self.request_inner(method, params, timeout, host, control);
             self.in_request.store(false, Ordering::SeqCst);
             r
         }
@@ -280,7 +356,17 @@ mod native {
             Some(Notifier(self.to_plugin.clone()))
         }
 
-        fn request_inner(&mut self, method: &str, params: Json, timeout: Duration, host: &mut HostHandler<'_>) -> Result<Json, RequestError> {
+        fn request_inner(
+            &mut self,
+            method: &str,
+            params: Json,
+            timeout: Duration,
+            host: &mut HostHandler<'_>,
+            control: Option<&RequestControl>,
+        ) -> Result<Json, RequestError> {
+            if let Some(control) = control {
+                control.remaining()?;
+            }
             let id = self.next_id;
             self.next_id = self.next_id.wrapping_add(1);
             let mut bytes = serde_json::to_vec(&json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))
@@ -289,18 +375,35 @@ mod native {
             self.to_plugin.send(bytes).map_err(|_| RequestError::fatal("the plugin stopped reading"))?;
             let mut deadline = Instant::now() + timeout;
             loop {
-                let left = deadline.saturating_duration_since(Instant::now());
+                let mut left = deadline.saturating_duration_since(Instant::now());
+                if let Some(control) = control {
+                    left = left.min(control.remaining()?).min(Duration::from_millis(20));
+                }
                 let msg = match self.from_plugin.recv_timeout(left) {
                     Ok(Ok(msg)) => msg,
                     Ok(Err(e)) => return Err(RequestError::fatal(self.with_stderr(e))),
                     Err(RecvTimeoutError::Timeout) => {
+                        if let Some(control) = control {
+                            control.remaining()?;
+                            if Instant::now() < deadline {
+                                continue;
+                            }
+                        }
                         return Err(RequestError::fatal(format!("{method} took longer than {} ms", timeout.as_millis())));
                     }
                     Err(RecvTimeoutError::Disconnected) => return Err(RequestError::fatal("the plugin exited")),
                 };
+                // Recheck after receiving: a response arriving at the deadline must not
+                // dispatch a late workbook mutation or report success after cancellation.
+                if let Some(control) = control {
+                    control.remaining()?;
+                }
                 if let Some(call) = msg.get("method").and_then(Json::as_str) {
                     // The plugin asks the host something while it works (or notifies it).
                     let answer = host(call, msg.get("params").unwrap_or(&Json::Null));
+                    if let Some(control) = control {
+                        control.remaining()?;
+                    }
                     if let Some(rid) = msg.get("id") {
                         let reply = match answer {
                             Ok(result) => json!({"jsonrpc": "2.0", "id": rid, "result": result}),

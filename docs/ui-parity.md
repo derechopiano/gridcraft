@@ -1,6 +1,6 @@
 # UI parity
 
-> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-15 · **Change:** minor (Share and the live session's people in the title bar; previously minor: File › Options › Add-ins) · **Target:** Microsoft Excel (Microsoft 365), Excel for Mac 16.113.4
+> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-17 · **Change:** minor (optional Python workbook projects in the shared Developer editor) · **Target:** Microsoft Excel (Microsoft 365), Excel for Mac 16.113.4
 
 Interaction, controls and feel, against Excel. Part of [target-app-parity.md](target-app-parity.md).
 **UI/UX fidelity: ~55% ready, 50–80 h** (estimated). Ribbon command coverage is measured
@@ -157,10 +157,20 @@ Key tips 3–5 · remaining shortcuts with their features 2–4 · context menus
 8–12 · Options dialog and ribbon/QAT customization 6–10 · accessibility 12–18 · selection and
 scrollbar bugs 2–4 · pixel/feel pass against observed Excel 7–12.
 
+## Optional Python workbook projects
+
+The shared Developer editor and Macros dialog support a Python provider, provider selection,
+Python module templates and PEP 723 settings. Run shows a responsive Stop/Escape modal and
+blocks conflicting workbook edits until completion or rollback. Download consent is session-only.
+Light/dark interaction tests and rendered snapshots were checked locally. This is a GridCraft
+extension, not Excel PY() parity; form controls and rich output/traceback navigation remain out
+of scope. See [python-macro-integration.md](python-macro-integration.md).
+
 ## Revision history
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-17 | minor | optional Python workbook projects in the shared Developer editor |
 | 2026-10-15 | minor | Title bar: Share for live sessions (state, popover) and the people's circles; narrow-window and full-screen layout; Export moved to More commands |
 | 2026-10-13 | minor | File › Options lists add-ins: documentation link, Activate / Deactivate |
 | 2026-10-12 | minor | The File view's recent list tells when each workbook was last changed, read off the UI thread |

@@ -25,6 +25,7 @@ mod ods;
 mod package;
 mod passthrough;
 mod pivot;
+mod python_macros;
 mod read;
 mod richdata;
 mod sheet_read;
