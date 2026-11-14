@@ -226,40 +226,47 @@ pub(crate) fn show(app: &mut SheetApp, ctx: &egui::Context) {
     }
     let mut close = false;
     let mut load = false;
+    // The message box is drawn above this modal and owns Escape until it closes.
+    let message_open = app.message.is_some();
     egui::Modal::new(egui::Id::unique("pdf.import")).show(ctx, |ui| {
         let lang = crate::i18n::current(ctx);
         ui.set_width((ctx.content_rect().width() - 40.0).clamp(240.0, 650.0));
-        ui.heading(lang.tr("Import PDF Table"));
-        ui.label(std::path::Path::new(&state.path).file_name().and_then(|s| s.to_str()).unwrap_or(&state.path));
-        ui.label(lang.tr("Bordered tables with selectable text. Data is loaded into a new worksheet."));
-        ui.horizontal(|ui| {
-            let page_label = ui.label(lang.tr("Page"));
-            let max = if state.pages == 0 { u32::MAX } else { u32::try_from(state.pages).unwrap_or(u32::MAX).max(1) };
-            if ui.add_enabled(state.job.is_none(), egui::DragValue::new(&mut state.page).range(1..=max)).labelled_by(page_label.id).changed() {
-                state.preview = None;
-            }
-            if ui.add_enabled(state.job.is_none(), egui::Button::new(lang.tr("Preview page"))).clicked() {
-                state.start(ctx);
-            }
-            ui.label(if state.pages == 0 { "/ ?".into() } else { format!("/ {}", state.pages) });
-        });
-        if state.job.is_some() {
+        // Scroll the entire dialog, not just its cells, so the footer remains reachable
+        // at the minimum window size and at larger interface zoom factors.
+        egui::ScrollArea::vertical().id_salt("pdf.import.body").max_height((ctx.content_rect().height() - 32.0).max(1.0)).show(ui, |ui| {
+            ui.heading(lang.tr("Import PDF Table"));
+            ui.label(std::path::Path::new(&state.path).file_name().and_then(|s| s.to_str()).unwrap_or(&state.path));
+            ui.label(lang.tr("Bordered tables with selectable text. Data is loaded into a new worksheet."));
             ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label(lang.tr("Reading PDF tables…"));
+                let page_label = ui.label(lang.tr("Page"));
+                let max = if state.pages == 0 { u32::MAX } else { u32::try_from(state.pages).unwrap_or(u32::MAX).max(1) };
+                if ui.add_enabled(state.job.is_none(), egui::DragValue::new(&mut state.page).range(1..=max)).labelled_by(page_label.id).changed() {
+                    state.preview = None;
+                }
+                if ui.add_enabled(state.job.is_none(), egui::Button::new(lang.tr("Preview page"))).clicked() {
+                    state.start(ctx);
+                }
+                ui.label(if state.pages == 0 { "/ ?".into() } else { format!("/ {}", state.pages) });
             });
-            ctx.request_repaint_after(std::time::Duration::from_millis(100));
-        }
-        if let Some(error) = &state.error {
-            ui.colored_label(crate::theme::Tokens::get(ctx).warning, lang.tr_error(error));
-        }
-        table_picker(ui, &mut state);
-        ui.checkbox(&mut state.as_table, lang.tr("Format as table"));
-        ui.checkbox(&mut state.headers, lang.tr("First row contains headers"));
-        ui.horizontal(|ui| {
-            let ready = state.job.is_none() && state.preview.as_ref().is_some_and(|p| p.page == state.page && p.tables.get(state.selected).is_some());
-            load = ui.add_enabled(ready, egui::Button::new(lang.tr("Load"))).clicked();
-            close = ui.button(lang.tr("Cancel")).clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape));
+            if state.job.is_some() {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(lang.tr("Reading PDF tables…"));
+                });
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            }
+            if let Some(error) = &state.error {
+                ui.colored_label(crate::theme::Tokens::get(ctx).warning, lang.tr_error(error));
+            }
+            table_picker(ui, &mut state);
+            ui.checkbox(&mut state.as_table, lang.tr("Format as table"));
+            ui.checkbox(&mut state.headers, lang.tr("First row contains headers"));
+            ui.horizontal(|ui| {
+                let ready =
+                    state.job.is_none() && state.preview.as_ref().is_some_and(|p| p.page == state.page && p.tables.get(state.selected).is_some());
+                load = ui.add_enabled(ready, egui::Button::new(lang.tr("Load"))).clicked();
+                close = ui.button(lang.tr("Cancel")).clicked() || (!message_open && ui.input(|i| i.key_pressed(egui::Key::Escape)));
+            });
         });
     });
     if load {
@@ -284,12 +291,16 @@ mod tests {
     use egui_kittest::kittest::Queryable as _;
     type Harness = egui_kittest::Harness<'static, SheetApp>;
     fn harness(dark: bool) -> Harness {
+        harness_with_size(dark, egui::vec2(1100., 800.), 100)
+    }
+    fn harness_with_size(dark: bool, size: egui::Vec2, percent: u16) -> Harness {
         let mut session = gridcraft_engine::Session::new();
         session.new_workbook();
         let mut app = SheetApp::new(session, Default::default());
         app.use_prepared_fonts();
         app.ui.dark = dark;
         app.ui.system_theme = false;
+        app.run("view.interfaceScale", json!({"percent":percent})).unwrap();
         let mut state = State::new("original-sample.pdf".into(), app.session.doc().unwrap().uid);
         state.started = true;
         state.pages = 2;
@@ -303,7 +314,7 @@ mod tests {
         });
         app.pdf_import = Some(state);
         let mut h = egui_kittest::Harness::builder()
-            .with_size(egui::vec2(1100., 800.))
+            .with_size(size)
             .with_context_setup(move |ctx| {
                 ctx.set_fonts(crate::theme::pinned_font_definitions());
                 crate::theme::apply(ctx, dark);
@@ -356,6 +367,9 @@ mod tests {
         let state = h.state_mut().pdf_import.as_mut().unwrap();
         state.job = Some(Job { rx, stop: stop.clone() });
         h.run_steps(2);
+        // The progress row can move the footer below the dialog's scroll viewport.
+        h.get_by_role_and_label(egui::accesskit::Role::Button, "Cancel").scroll_to_me();
+        h.run_steps(30);
         h.get_by_role_and_label(egui::accesskit::Role::Button, "Cancel").click();
         h.run_steps(2);
         assert!(stop.load(Ordering::Relaxed));
@@ -385,5 +399,55 @@ mod tests {
         assert_eq!(preview_text("00123"), "00123");
         assert_eq!(preview_text(&"é".repeat(513)).chars().count(), 513);
         assert!(preview_text(&"line\n".repeat(100)).lines().count() <= 8);
+    }
+    fn escape(h: &mut Harness) {
+        for pressed in [true, false] {
+            h.input_mut().events.push(egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
+        h.run_steps(2);
+    }
+    #[test]
+    fn escape_dismisses_the_message_before_the_import_and_keeps_column_choices() {
+        let mut h = harness(false);
+        h.state_mut().pdf_import.as_mut().unwrap().numeric[1] = true;
+        h.state_mut().message = Some(("PDF import warning".into(), "An editor draft needs attention.".into()));
+        h.run_steps(3);
+        escape(&mut h);
+        assert!(h.state().message.is_none());
+        assert!(h.state().pdf_import.as_ref().unwrap().numeric[1]);
+        escape(&mut h);
+        assert!(h.state().pdf_import.is_none());
+        assert_eq!(h.state().session.doc().unwrap().wb.sheets.len(), 1);
+    }
+    #[test]
+    fn import_controls_remain_reachable_in_small_scaled_windows() {
+        for percent in [100, 150, 200] {
+            let mut h = harness_with_size(false, egui::vec2(640., 420.), percent);
+            let state = h.state_mut().pdf_import.as_mut().unwrap();
+            state.preview.as_mut().unwrap().tables[0].rows = vec![vec!["Code".into(), "Description".into()]];
+            state.preview.as_mut().unwrap().tables[0]
+                .rows
+                .extend((1..20).map(|i| vec![format!("Item {i}"), "First line\nSecond line\nThird line\nFourth line".into()]));
+            h.run_steps(4);
+            for label in ["Format as table", "First row contains headers", "Load"] {
+                h.get_by_label(label).scroll_to_me();
+                h.run_steps(30);
+                let rect = h.get_by_label(label).rect();
+                assert!(h.ctx.content_rect().contains_rect(rect), "{label} is clipped at {percent}%: {rect:?}");
+            }
+            if let Ok(dir) = std::env::var("GRIDCRAFT_PDF_REVIEW_SNAPSHOT_DIR") {
+                h.render().unwrap().save(std::path::Path::new(&dir).join(format!("review-small-{percent}.png"))).unwrap();
+            }
+            h.get_by_label("Load").click();
+            h.run_steps(3);
+            assert!(h.state().pdf_import.is_none(), "Load must work at {percent}%");
+            assert_eq!(h.state().session.doc().unwrap().wb.sheets.len(), 2);
+        }
     }
 }

@@ -227,3 +227,20 @@ fn a_missing_outer_border_does_not_silently_drop_the_last_column() {
         Err(pdf_import::ImportError::Unsupported(_))
     ));
 }
+
+#[test]
+fn mapped_boundary_spaces_survive_extraction_loading_and_reopening() {
+    let content = OPERATORS.replace("(00123)", "( 00123 )").replace("(=1+1)", "( =1+1 )");
+    let preview = pdf_import::inspect(Arc::new(operator_pdf(&content, "")), 1, Arc::new(AtomicBool::new(false))).unwrap();
+    assert_eq!(preview.tables[0].rows[1], vec![" 00123 ", " =1+1 "]);
+    let mut s = session();
+    s.execute("data.fromPdf", json!({"rows":preview.tables[0].rows})).unwrap();
+    let bytes = gridcraft_engine::io::save_bytes(&s.active().unwrap().wb, "Spaces.xlsx").unwrap();
+    let (wb, _) = gridcraft_engine::io::open_bytes("Spaces.xlsx", &bytes).unwrap();
+    for (col, expected) in [" 00123 ", " =1+1 "].iter().enumerate() {
+        let at = CellRef::new(1, col as u32);
+        let sh = wb.sheet(1).unwrap();
+        assert_eq!(sh.value(at), Value::text(*expected));
+        assert!(sh.cell(at).unwrap().formula.is_none());
+    }
+}

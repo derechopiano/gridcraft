@@ -174,7 +174,7 @@ fn cell_text(letters: &mut [&Letter]) -> String {
         }
         at = end;
     }
-    text.trim().to_string()
+    text
 }
 
 #[cfg(test)]
